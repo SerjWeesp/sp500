@@ -1,0 +1,8 @@
+# Ignore CatBoost temporary files
+*.json
+*.tsv
+*.tmp
+*.tfevents
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
