@@ -1,8 +1,70 @@
-# Ignore CatBoost temporary files
-*.json
-*.tsv
-*.tmp
-*.tfevents
-
-# Ignore Jupyter Notebook checkpoints
+# Ignore all Jupyter notebook checkpoints
 .ipynb_checkpoints/
+**/*.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+*checkpoint.ipynb
+
+# Ignore all CatBoost output directories
+catboost_info/
+catboost/
+# Ignore all LightGBM output directories
+lightgbm_info/
+lightgbm/
+# Ignore all XGBoost output directories
+xgboost_info/
+xgboost/
+# Ignore all TensorFlow output directories
+tf_info/
+tf/
+# Ignore all PyTorch output directories
+torch_info/
+torch/
+# Ignore all Scikit-learn output directories
+sklearn_info/
+sklearn/
+# Ignore all Keras output directories
+keras_info/
+keras/
+
+# Ignore all temporary files
+tmp/
+**/tmp/
+*.tmp
+
+# Ignore all pkg directories
+pkg/
+**/pkg/
+
+# Ignore all joblib files
+*.joblib
+
+# Ignore all pycache directories
+__pycache__/
+**/__pycache__/
+
+# Ignore all .DS_Store files
+.DS_Store
+
+# Ignore all json files
+*.json
+
+# Ignore all log files
+*.log
+
+# Ignore all tsv files
+*.tsv
+
+# Ignore all pickle files
+*.pkl
+
+# Ignore all pickle files
+*.h5
+
+# Ignore all CSV files
+*.csv
+
+# Ignore all XML files
+*.xml
+
+# Ignore all TXT files
+*.txt

@@ -24,6 +24,6 @@ soup_wiki = BeautifulSoup(wiki_response.text, 'html.parser')
 table = soup_wiki.find('table', {'class': "wikitable"})
 sp500 = pd.read_html(str(table))[0]
 
-tickers = sp500['Symbol'].str.replace('.', '-', regex=False)
-tickers.to_csv('tickers.csv')
-print("Total number of tickers: ", len(tickers))
+# tickers = sp500['Symbol'].str.replace('.', '-', regex=False)
+sp500.to_csv('sp500_names.csv')
+print("Total number of tickers: ", len(sp500))
