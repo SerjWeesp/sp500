@@ -68,3 +68,6 @@ __pycache__/
 
 # Ignore all TXT files
 *.txt
+
+# Ignore all PyTorch model files
+*.pth
