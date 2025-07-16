@@ -71,3 +71,6 @@ __pycache__/
 
 # Ignore all PyTorch model files
 *.pth
+
+# Ignore all TensorFlow model files
+*tfevents*
