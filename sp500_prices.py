@@ -45,4 +45,4 @@ for ticker_sym in tickers:
     count += 1
     print(count, f"{ticker_sym} processed. Total records: {len(price_df)}")
 
-price_df.to_csv('sp500_prices.csv')
+price_df.to_csv('sp500_prices_12082025.csv')
