@@ -4,21 +4,21 @@ Created on Fri Feb 21 21:26:31 2025
 
 @author: Pavilion
 """
+import os
 import pandas as pd
 import requests
 import time
+from datetime import datetime
 import yfinance as yf
 from bs4 import BeautifulSoup
 
+DATA_DIR = r"D:/GitHub/sp500"
+run_stamp = datetime.now().strftime("%d%m%Y")  # {timestamp}
+final_csv = os.path.join(DATA_DIR, f"sp500_prices_{run_stamp}.csv")
+names_csv = os.path.join(DATA_DIR, "sp500_names.csv")
+sp500_names = pd.read_csv(names_csv)
+tickers = sp500_names["Symbol"].astype(str).tolist()
 
-wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-
-wiki_response = requests.get(wiki_url)
-soup_wiki = BeautifulSoup(wiki_response.text, 'html.parser')
-table = soup_wiki.find('table', {'class': "wikitable"})
-sp500 = pd.read_html(str(table))[0]
-
-tickers = sp500['Symbol'].str.replace('.', '-', regex=False)
 
 # Stock data
 price_df = pd.DataFrame()
@@ -45,4 +45,4 @@ for ticker_sym in tickers:
     count += 1
     print(count, f"{ticker_sym} processed. Total records: {len(price_df)}")
 
-price_df.to_csv('sp500_prices_12082025.csv')
+price_df.to_csv(final_csv)
