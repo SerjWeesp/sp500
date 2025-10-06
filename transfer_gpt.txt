@@ -1,88 +1,270 @@
-def build_flow_layers(...,
-    prob_threshold: float = 0.0,
-    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
-    which_terminals=None,
-):
+from collections import defaultdict, deque
+from typing import Dict, Tuple, List, Any, Optional
 
-!!!!!!!!!!!!!!!!!!!!!!!
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch, Rectangle, Circle
 
-def draw_asc_flow_matplotlib(...,
-    prob_threshold: float = 0.0,
-    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
-    which_terminals=None,
-    ...
-):
 
-!!!!!!!!!!!!!!!!!!!!!!!!!!
+# ---------- helpers ----------
 
-state_layers, action_layers, edges, term_clones = build_flow_layers(
+def iter_action_successors(action_obj, pre_state=None, prob_threshold: float = 0.0):
+    """
+    Yield (post_state, p) for a given action. Supports two shapes:
+      A) probabilities[pre_state][post_state] = p
+      B) probabilities[post_state] = p (independent of pre_state)
+    Includes zero-prob edges when p >= prob_threshold.
+    """
+    probs = getattr(action_obj, "probabilities", {}) or {}
+
+    # Shape A?
+    if any(isinstance(v, dict) for v in probs.values()):
+        row = probs.get(pre_state, {}) if pre_state is not None else {}
+        for post_s, p in row.items():
+            if p is not None and p >= prob_threshold:
+                yield post_s, float(p)
+    else:
+        # Shape B
+        for post_s, p in probs.items():
+            if p is not None and p >= prob_threshold:
+                yield post_s, float(p)
+
+
+def all_from_states(asc):
+    """Collect every pre-state that appears in actions' from_states (if present)."""
+    res = set()
+    for _a_name, a_obj in getattr(asc, "actions", {}).items():
+        fs = getattr(a_obj, "from_states", None)
+        if fs:
+            res.update(fs)
+    return res
+
+
+def is_terminal_state(asc, s, from_states_cache=None):
+    """Conservative terminal check."""
+    st = asc.states.get(s)
+    if st is None:
+        return True
+    if getattr(st, "is_terminal", False):
+        return True
+    if not getattr(st, "actions", []):
+        return True
+    if from_states_cache is not None and s not in from_states_cache:
+        # appears in no 'from_states' anywhere
+        return True
+    return False
+
+
+# ---------- layer builder ----------
+
+def build_flow_layers(
     asc,
-    start_state=start_state,
-    prob_threshold=prob_threshold,
-    terminal_clone_scope=terminal_clone_scope,
-    which_terminals=which_terminals,
-)
+    start_state: str,
+    prob_threshold: float = 0.0,
+    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
+    which_terminals=None,                # set of names or None (meaning "all terminals")
+):
+    """
+    Returns:
+      state_layers: dict[state_or_clone -> even layer index]
+      action_layers: dict[action -> odd layer index]
+      edges: list[(u, v, {"p": float|None, "label": str|None})]
+      term_clones: dict[clone_name -> {"base": base_state, "scope": ("action", a) or ("layer", L)}]
+    """
+    if start_state not in asc.states:
+        raise ValueError(f"start_state {start_state!r} not found in asc.states")
+
+    if terminal_clone_scope not in {"none", "action", "layer"}:
+        raise ValueError("terminal_clone_scope must be 'none', 'action', or 'layer'.")
+
+    from_states_cache = all_from_states(asc)
+
+    state_layers: Dict[str, int] = {start_state: 0}
+    action_layers: Dict[str, int] = {}
+    edges: List[Tuple[str, str, Dict[str, Any]]] = []
+    term_clones: Dict[str, Dict[str, Any]] = {}
+
+    q = deque([start_state])
+
+    while q:
+        s = q.popleft()
+        s_layer = state_layers[s]  # even
+        s_obj = asc.states[s]
+
+        for a in getattr(s_obj, "actions", []):
+            # edge S -> A (unlabeled)
+            edges.append((s, a, {"p": None, "label": None}))
+            action_layers.setdefault(a, s_layer + 1)
+
+            a_obj = asc.actions[a]
+
+            for s_prime, p in iter_action_successors(
+                a_obj, pre_state=s, prob_threshold=prob_threshold
+            ):
+                terminal = is_terminal_state(asc, s_prime, from_states_cache)
+
+                clone_this = (
+                    terminal
+                    and terminal_clone_scope in {"action", "layer"}
+                    and (which_terminals is None or s_prime in which_terminals)
+                )
+
+                if clone_this:
+                    if terminal_clone_scope == "action":
+                        # one clone per (base terminal, action)
+                        clone_name = f"{s_prime}|a:{a}"
+                        clone_meta = {"base": s_prime, "scope": ("action", a)}
+                        target_layer = action_layers[a] + 1
+                    else:  # "layer": one clone per (base terminal, LAYER)
+                        L = action_layers[a]
+                        clone_name = f"{s_prime}|L:{L}"
+                        clone_meta = {"base": s_prime, "scope": ("layer", L)}
+                        target_layer = L + 1
+
+                    if clone_name not in term_clones:
+                        term_clones[clone_name] = clone_meta
+                        state_layers.setdefault(clone_name, target_layer)
+
+                    edges.append((a, clone_name, {"p": p, "label": f"{p:.3f}"}))
+
+                else:
+                    # connect to the canonical next state
+                    edges.append((a, s_prime, {"p": p, "label": f"{p:.3f}"}))
+                    if s_prime not in state_layers:
+                        state_layers[s_prime] = s_layer + 2
+                        q.append(s_prime)
+
+    return state_layers, action_layers, edges, term_clones
 
 
-terminal = is_terminal_state(asc, s_prime, from_states_cache)
+# ---------- layout helpers ----------
 
-clone_this = (
-    terminal
-    and terminal_clone_scope in {"action", "layer"}
-    and (which_terminals is None or s_prime in which_terminals)
-)
-
-if clone_this:
-    if terminal_clone_scope == "action":
-        # one clone per (base terminal, action)
-        clone_name = f"{s_prime}|a:{a}"
-        clone_meta = {"base": s_prime, "scope": ("action", a)}
-    else:  # "layer"
-        L = action_layers[a]
-        # one clone per (base terminal, LAYER)
-        clone_name = f"{s_prime}|L:{L}"
-        clone_meta = {"base": s_prime, "scope": ("layer", L)}
-
-    if clone_name not in term_clones:
-        term_clones[clone_name] = clone_meta
-        # put the clone one step to the right of its action layer
-        state_layers.setdefault(clone_name, action_layers[a] + 1)
-
-    edges.append((a, clone_name, {"p": p, "label": f"{p:.3f}"}))
-else:
-    edges.append((a, s_prime, {"p": p, "label": f"{p:.3f}"}))
-    if s_prime not in state_layers:
-        state_layers[s_prime] = s_layer + 2
-        q.append(s_prime)
+def positions_by_layer(names, layer_map):
+    by_layer = defaultdict(list)
+    for n in names:
+        by_layer[layer_map[n]].append(n)
+    pos = {}
+    for L, nodes in by_layer.items():
+        nodes = sorted(nodes)
+        m = len(nodes)
+        ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
+        for n, y in zip(nodes, ys):
+            pos[n] = (L, y)
+    return pos
 
 
-!!!!!!!!!!!!!!!!!!!!!!
+# ---------- main draw ----------
 
-pos_clones = {}
-groups = defaultdict(list)  # key: action name OR layer index -> list of clone ids
+def draw_asc_flow_matplotlib(
+    asc,
+    start_state: str,
+    prob_threshold: float = 0.0,
+    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
+    which_terminals=None,
+    figsize=(12, 7),
+    title: Optional[str] = None,
+    hscale: float = 1.6,
+):
+    state_layers, action_layers, edges, term_clones = build_flow_layers(
+        asc,
+        start_state=start_state,
+        prob_threshold=prob_threshold,
+        terminal_clone_scope=terminal_clone_scope,
+        which_terminals=which_terminals,
+    )
 
-for clone, meta in term_clones.items():
-    scope, key = meta["scope"]  # ("action", a) or ("layer", L)
-    groups[(scope, key)].append(clone)
+    # Names
+    clone_names = set(term_clones.keys())
+    state_names = [s for s in state_layers if s not in clone_names]
+    action_names = list(action_layers.keys())
 
-for (scope, key), clones in groups.items():
-    if scope == "action":
-        # keep old behavior for action scope
-        ax_x, ax_y = positions_by_layer(action_layers.keys(), action_layers)[key]
-        L = action_layers[key]
-    else:  # scope == "layer"
-        L = key
-        # center vertically around 0 for this layer
-        ax_x, ax_y = (L, 0.0)
+    # Base positions for canonical states & actions
+    pos_states = positions_by_layer(state_names, state_layers)
+    pos_actions = positions_by_layer(action_names, action_layers)
 
-    cx = L + 2  # draw a bit to the right of the action/layer
-    step = 0.35
-    for i, clone in enumerate(clones):
-        cy = ax_y - step * (i + 1 if len(clones) > 1 else 1)
-        pos_clones[clone] = (cx, cy)
+    # Normalize X (columns) to [0, hscale]
+    all_layers = list(state_layers.values()) + list(action_layers.values())
+    Lmin, Lmax = min(all_layers), max(all_layers)
 
-!!!!!!!!!!!!!!
+    def xnorm(L):
+        if Lmax == Lmin:
+            return 0.0
+        return ((L - Lmin) / (Lmax - Lmin)) * hscale
 
-base = term_clones[clone]["base"]
-ax.add_patch(Rectangle((x - 0.03, y - 0.045), 0.06, 0.09, ec="black", fc="white"))
-ax.text(x, y, base, fontsize=9, ha="center", va="center")
+    # Compute positions for clone nodes according to their scope (action or layer)
+    pos_clones: Dict[str, Tuple[float, float]] = {}
+    if term_clones:
+        groups = defaultdict(list)  # key: ('action', a) or ('layer', L) -> [clone_ids]
+        for clone, meta in term_clones.items():
+            groups[meta["scope"]].append(clone)
+
+        for (scope, key), clones in groups.items():
+            if scope == "action":
+                # Anchor around the action's position
+                ax_x, ax_y = pos_actions[key]
+                L = action_layers[key]
+            else:  # scope == "layer"
+                L = key
+                ax_x, ax_y = (L, 0.0)  # center of that column
+
+            cx = (L + 2)  # draw a bit to the right of the anchor column
+            step = 0.35
+            for i, clone in enumerate(clones):
+                cy = ax_y - step * (i + 1 if len(clones) > 1 else 1)
+                pos_clones[clone] = (cx, cy)
+
+    # ----- draw -----
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.axis("off")
+    if title:
+        ax.set_title(title)
+
+    # states (canonical)
+    for s in state_names:
+        xL, y = pos_states[s]
+        x = xnorm(xL)
+        ax.add_patch(Rectangle((x - 0.03, y - 0.045), 0.06, 0.09, ec="black", fc="white"))
+        ax.text(x, y, s, fontsize=9, ha="center", va="center")
+
+    # actions
+    for a in action_names:
+        xL, y = pos_actions[a]
+        x = xnorm(xL)
+        circ = Circle((x, y), 0.035, ec="black", fc="lightgrey")
+        ax.add_patch(circ)
+        ax.text(x, y, a, fontsize=9, ha="center", va="center")
+
+    # cloned terminals (draw with base name)
+    for clone, (cxL, cy) in pos_clones.items():
+        x = xnorm(cxL)
+        base = term_clones[clone]["base"]
+        ax.add_patch(Rectangle((x - 0.03, cy - 0.045), 0.06, 0.09, ec="black", fc="white"))
+        ax.text(x, cy, base, fontsize=9, ha="center", va="center")
+
+    # edges
+    def arrow(xy0, xy1, label=None, lw=1.0, color="black"):
+        ax.add_patch(FancyArrowPatch(xy0, xy1, arrowstyle="-|>", lw=lw, color=color, mutation_scale=20))
+        if label:
+            xm = (xy0[0] + xy1[0]) / 2
+            ym = (xy0[1] + xy1[1]) / 2
+            ax.text(xm, ym + 0.04, label, fontsize=8, ha="center")
+
+    def get_xy(node):
+        if node in pos_states:
+            xL, y = pos_states[node]
+        elif node in pos_actions:
+            xL, y = pos_actions[node]
+        else:
+            xL, y = pos_clones[node]
+        return (xnorm(xL), y)
+
+    for u, v, data in edges:
+        x0, y0 = get_xy(u)
+        x1, y1 = get_xy(v)
+        lw = 1.0 if data.get("p") is None else 1.0 + 3.0 * data["p"]  # width ~ prob
+        # small horizontal offsets so arrows start/end at glyph edges
+        arrow((x0 + 0.05, y0), (x1 - 0.05, y1), label=data.get("label"), lw=lw)
+
+    ax.set_xlim(-0.05, 1.05 * hscale)
+    ax.set_ylim(-1.4, 1.2)
+    plt.tight_layout()
+    return fig, ax
