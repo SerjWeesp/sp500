@@ -1,37 +1,88 @@
+def build_flow_layers(...,
+    prob_threshold: float = 0.0,
+    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
+    which_terminals=None,
+):
+
+!!!!!!!!!!!!!!!!!!!!!!!
+
+def draw_asc_flow_matplotlib(...,
+    prob_threshold: float = 0.0,
+    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
+    which_terminals=None,
+    ...
+):
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 state_layers, action_layers, edges, term_clones = build_flow_layers(
     asc,
     start_state=start_state,
     prob_threshold=prob_threshold,
-    split_terminals_by_action=split_terminals_by_action,
+    terminal_clone_scope=terminal_clone_scope,
     which_terminals=which_terminals,
 )
 
-# --- NEW: collapse per-action terminal clones to a single node per base ---
-if merge_terminal_targets and term_clones:
-    # Map clone -> base, and collect incoming actions per base
-    clone_to_base = {clone: meta["base"] for clone, meta in term_clones.items()}
-    base_incoming_layers = defaultdict(list)
-    for u, v, _data in edges:
-        if v in clone_to_base:
-            base = clone_to_base[v]
-            if u in action_layers:
-                base_incoming_layers[base].append(action_layers[u])
 
-    # Place each base terminal one layer to the right of its rightmost incoming action
-    for base, incoming in base_incoming_layers.items():
-        layer = (max(incoming) + 1) if incoming else (max(action_layers.values()) + 1)
-        state_layers[base] = max(state_layers.get(base, layer), layer)
+terminal = is_terminal_state(asc, s_prime, from_states_cache)
 
-    # Rewrite edges to point to base; drop true clone nodes from layers
-    new_edges = []
-    for u, v, data in edges:
-        v2 = clone_to_base.get(v, v)
-        new_edges.append((u, v2, data))
-    edges = new_edges
+clone_this = (
+    terminal
+    and terminal_clone_scope in {"action", "layer"}
+    and (which_terminals is None or s_prime in which_terminals)
+)
 
-    # Remove clones from the layer map so we only draw each terminal once
-    for clone in list(term_clones.keys()):
-        state_layers.pop(clone, None)
+if clone_this:
+    if terminal_clone_scope == "action":
+        # one clone per (base terminal, action)
+        clone_name = f"{s_prime}|a:{a}"
+        clone_meta = {"base": s_prime, "scope": ("action", a)}
+    else:  # "layer"
+        L = action_layers[a]
+        # one clone per (base terminal, LAYER)
+        clone_name = f"{s_prime}|L:{L}"
+        clone_meta = {"base": s_prime, "scope": ("layer", L)}
 
-    # After merging, clones don’t need special positioning any more
-    term_clones = {}
+    if clone_name not in term_clones:
+        term_clones[clone_name] = clone_meta
+        # put the clone one step to the right of its action layer
+        state_layers.setdefault(clone_name, action_layers[a] + 1)
+
+    edges.append((a, clone_name, {"p": p, "label": f"{p:.3f}"}))
+else:
+    edges.append((a, s_prime, {"p": p, "label": f"{p:.3f}"}))
+    if s_prime not in state_layers:
+        state_layers[s_prime] = s_layer + 2
+        q.append(s_prime)
+
+
+!!!!!!!!!!!!!!!!!!!!!!
+
+pos_clones = {}
+groups = defaultdict(list)  # key: action name OR layer index -> list of clone ids
+
+for clone, meta in term_clones.items():
+    scope, key = meta["scope"]  # ("action", a) or ("layer", L)
+    groups[(scope, key)].append(clone)
+
+for (scope, key), clones in groups.items():
+    if scope == "action":
+        # keep old behavior for action scope
+        ax_x, ax_y = positions_by_layer(action_layers.keys(), action_layers)[key]
+        L = action_layers[key]
+    else:  # scope == "layer"
+        L = key
+        # center vertically around 0 for this layer
+        ax_x, ax_y = (L, 0.0)
+
+    cx = L + 2  # draw a bit to the right of the action/layer
+    step = 0.35
+    for i, clone in enumerate(clones):
+        cy = ax_y - step * (i + 1 if len(clones) > 1 else 1)
+        pos_clones[clone] = (cx, cy)
+
+!!!!!!!!!!!!!!
+
+base = term_clones[clone]["base"]
+ax.add_patch(Rectangle((x - 0.03, y - 0.045), 0.06, 0.09, ec="black", fc="white"))
+ax.text(x, y, base, fontsize=9, ha="center", va="center")
