@@ -2,106 +2,73 @@ def draw_asc_flow_matplotlib(
     asc,
     start_state: str,
     prob_threshold: float = 0.0,
-    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
+    terminal_clone_scope: str = "none",      # "none" | "action" | "layer"
     which_terminals=None,
     figsize=(12, 7),
     title=None,
     hscale: float = 1.6,
     *,
-    # text styling
+    probs_attr: str = "auto",                # "auto" | "real" | "model"
     state_text_rotation: float = 0.0,
     action_text_rotation: float = 0.0,
     terminal_text_rotation: float = 0.0,
     edge_label_rotation: "float|str|None" = "auto",   # "auto", number, or None
-    # edge-label overlap handling
-    edge_label_jitter_y: float = 0.03,
-    edge_label_jitter_mode: str = "hash",             # "hash" (stable) | "random"
-    edge_label_seed: int | None = None,
-    # dedupe aggregation for multiple A->target edges
-    action_edge_prob_agg: str = "max",                # "max"|"mean"|"min"|"first"|"last"
-    # in-layer ordering controls
-    state_swaps: list[tuple[str, str]] | None = None,
-    action_swaps: list[tuple[str, str]] | None = None,
-    state_order_hint: dict[str, float] | None = None,   # lower = higher (top)
-    action_order_hint: dict[str, float] | None = None,
 ):
     """
-    Draw an ASC flow graph with clean layering and labeling.
-    Assumes helpers `build_flow_layers` and (optionally) imports for matplotlib
-    patches are already present in your module.
+    Draw an ASC flow graph using chosen probabilities (real/model), with:
+    - per-layer terminal clones (if requested)
+    - de-duplicated A->target edges (aggregation = max)
+    - labels above shapes
+    - dynamic bounds
+
+    Requires build_flow_layers(...) to accept `probs_attr` and pass it into
+    iter_action_successors(...).
     """
+    import numpy as np
     from collections import defaultdict
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyArrowPatch, Rectangle, Circle
 
-    # --- sizes ---
+    # ---- sizes ----
     RECT_W, RECT_H = 0.06, 0.09
     CIRCLE_R = 0.035
     LABEL_DY = 0.02
 
-    # --- build ---
+    # ---- build (probs_attr forwarded) ----
     state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
         asc,
         start_state=start_state,
         prob_threshold=prob_threshold,
         terminal_clone_scope=terminal_clone_scope,
         which_terminals=which_terminals,
+        probs_attr=probs_attr,
     )
 
-    # --- DEDUPE A->target edges (keep S->A as-is) ---
-    def _agg_update(cur, val):
-        if cur is None:
-            return val if action_edge_prob_agg != "mean" else (val, 1)
-        if action_edge_prob_agg == "max":   return max(cur, val)
-        if action_edge_prob_agg == "min":   return min(cur, val)
-        if action_edge_prob_agg == "last":  return val
-        if action_edge_prob_agg == "first": return cur
-        if action_edge_prob_agg == "mean":
-            s, n = (cur if isinstance(cur, tuple) else (cur, 1))
-            return (s + val, n + 1)
-        return max(cur, val)
-
-    def _agg_finalize(val):
-        if isinstance(val, tuple):
-            s, n = val
-            return s / n if n else 0.0
-        return val
-
+    # ---- DEDUPE A->target edges (keep S->A as-is); aggregation = MAX ----
     edges_SA = []
-    acc = {}  # (A, target) -> agg(p)
+    acc = {}  # (A, target) -> p_max
     for u, v, data in edges_raw:
         if (u in state_layers) and (v in action_layers):   # S->A
             edges_SA.append((u, v, {"p": None, "label": None}))
         else:                                              # A->state/clone
             p = float(data.get("p", 0.0))
             key = (u, v)
-            acc[key] = _agg_update(acc.get(key), p)
+            acc[key] = max(acc.get(key, p), p)
 
     edges_AT = []
-    for (u, v), val in acc.items():
-        p = float(_agg_finalize(val))
-        edges_AT.append((u, v, {"p": p, "label": f"{p:.3f}"}))
+    for (u, v), p in acc.items():
+        edges_AT.append((u, v, {"p": float(p), "label": f"{p:.3f}"}))
 
     edges = edges_SA + edges_AT
 
-    # --- local layout helper with order hints + swaps ---
-    def positions_by_layer(names, layer_map, *, order_hint=None, swap_pairs=None):
+    # ---- simple layout helper (alphabetical within layer) ----
+    def positions_by_layer(names, layer_map):
         by_layer = defaultdict(list)
         for n in names:
             by_layer[layer_map[n]].append(n)
         pos = {}
         for L, nodes in by_layer.items():
-            # base order
-            ordered = sorted(nodes, key=lambda n: (order_hint.get(n, 0) if order_hint else 0, n))
-            # swap pairs (only if both in this layer)
-            if swap_pairs:
-                idx = {n: i for i, n in enumerate(ordered)}
-                for a, b in swap_pairs:
-                    if a in idx and b in idx and layer_map.get(a) == L and layer_map.get(b) == L:
-                        ia, ib = idx[a], idx[b]
-                        idx[a], idx[b] = ib, ia
-                ordered = sorted(nodes, key=lambda n: idx[n])
-            # y spacing [-1..1]
+            ordered = sorted(nodes)
             m = len(ordered)
             ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
             for n, y in zip(ordered, ys):
@@ -113,19 +80,14 @@ def draw_asc_flow_matplotlib(
     state_names  = [s for s in state_layers if s not in clone_names]
     action_names = list(action_layers.keys())
 
-    # base positions
-    pos_states = positions_by_layer(
-        state_names, state_layers,
-        order_hint=state_order_hint, swap_pairs=state_swaps
-    )
-    pos_actions = positions_by_layer(
-        action_names, action_layers,
-        order_hint=action_order_hint, swap_pairs=action_swaps
-    )
+    # positions (x = layer index, y = spread)
+    pos_states  = positions_by_layer(state_names,  state_layers)
+    pos_actions = positions_by_layer(action_names, action_layers)
 
     # normalize X to [0, hscale]
     all_layers = list(state_layers.values()) + list(action_layers.values())
     Lmin, Lmax = min(all_layers), max(all_layers)
+
     def xnorm(L):
         return 0.0 if Lmax == Lmin else ((L - Lmin) / (Lmax - Lmin)) * hscale
 
@@ -138,10 +100,10 @@ def draw_asc_flow_matplotlib(
 
         for (scope, key), clones in groups.items():
             if scope == "action":
-                L_odd   = action_layers[key]
+                L_odd    = action_layers[key]
                 anchor_y = pos_actions[key][1]
             else:  # "layer"
-                L_odd   = key
+                L_odd    = key
                 anchor_y = 0.0
             target_even = L_odd + 1
             step = 0.35
@@ -149,19 +111,7 @@ def draw_asc_flow_matplotlib(
                 cy = anchor_y - step * (i + 1 if len(clones) > 1 else 1)
                 pos_clones[clone] = (target_even, cy)
 
-    # jitter helper
-    rng = np.random.default_rng(edge_label_seed)
-    def jitter_from_key(key):
-        if edge_label_jitter_y <= 0:
-            return 0.0
-        if edge_label_jitter_mode == "random":
-            return rng.uniform(-edge_label_jitter_y, edge_label_jitter_y)
-        b = repr(key).encode("utf-8")
-        h = int.from_bytes(hashlib.blake2b(b, digest_size=8).digest(), "big")
-        u = h / (2**64 - 1)
-        return (u * 2 - 1) * edge_label_jitter_y
-
-    # --- draw ---
+    # ---- draw ----
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
     ax.axis("off")
     if title:
@@ -192,7 +142,7 @@ def draw_asc_flow_matplotlib(
                 rotation=terminal_text_rotation, rotation_mode="anchor")
 
     # arrows + labels
-    def arrow(xy0, xy1, label=None, lw=1.0, key=None):
+    def arrow(xy0, xy1, label=None, lw=1.0):
         ax.add_patch(FancyArrowPatch(xy0, xy1, arrowstyle="-|>", lw=lw, color="black", mutation_scale=20))
         if label:
             xm = (xy0[0] + xy1[0]) / 2
@@ -206,9 +156,7 @@ def draw_asc_flow_matplotlib(
                     rot += 180
             else:
                 rot = 0.0
-            # jitter
-            jy = jitter_from_key(key)
-            ax.annotate(label, (xm, ym + jy), xytext=(0, 4), textcoords="offset points",
+            ax.annotate(label, (xm, ym), xytext=(0, 4), textcoords="offset points",
                         fontsize=8, ha="center", va="bottom",
                         rotation=rot, rotation_mode="anchor", clip_on=False)
 
@@ -246,7 +194,7 @@ def draw_asc_flow_matplotlib(
         x1, y1 = get_xy(v)
         lw = 1.0 if data.get("p") is None else 1.0 + 3.0 * data["p"]
         arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
-              label=data.get("label"), lw=lw, key=(u, v))
+              label=data.get("label"), lw=lw)
 
     # dynamic bounds to avoid clipping
     if xs and ys:
