@@ -15,14 +15,15 @@ def draw_asc_flow_matplotlib(
     edge_label_rotation: "float|str|None" = "auto",   # "auto", number, or None
 ):
     """
-    Draw an ASC flow graph using chosen probabilities (real/model), with:
-    - per-layer terminal clones (if requested)
-    - de-duplicated A->target edges (aggregation = max)
-    - labels above shapes
-    - dynamic bounds
+    Draw an ASC flow graph while choosing which probabilities to show/use
+    for edge widths (real vs model) *without changing build_flow_layers()*.
 
-    Requires build_flow_layers(...) to accept `probs_attr` and pass it into
-    iter_action_successors(...).
+    How it works:
+      - Calls your existing build_flow_layers(...) to get nodes/edges.
+      - Recomputes probability for each A->target edge from asc.actions[*]
+        using probs_attr ("auto" prefers 'real_probabilities' when present).
+      - Aggregates duplicates per (A, target) with MAX.
+      - Does NOT filter edges by new probs; it only affects labels & widths.
     """
     import numpy as np
     from collections import defaultdict
@@ -34,24 +35,66 @@ def draw_asc_flow_matplotlib(
     CIRCLE_R = 0.035
     LABEL_DY = 0.02
 
-    # ---- build (probs_attr forwarded) ----
+    # ---- call your existing builder (no probs_attr here) ----
     state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
         asc,
         start_state=start_state,
         prob_threshold=prob_threshold,
         terminal_clone_scope=terminal_clone_scope,
         which_terminals=which_terminals,
-        probs_attr=probs_attr,
     )
 
-    # ---- DEDUPE A->target edges (keep S->A as-is); aggregation = MAX ----
+    # ---- helper: fetch probability from the chosen source ----
+    def _get_action_probs_dict(action_obj):
+        """Return the dict to read probabilities from, based on probs_attr."""
+        if probs_attr == "real":
+            return getattr(action_obj, "real_probabilities", {}) or {}
+        if probs_attr == "model":
+            return getattr(action_obj, "probabilities", {}) or {}
+        # auto
+        rp = getattr(action_obj, "real_probabilities", None)
+        return (rp if rp else (getattr(action_obj, "probabilities", {}) or {}))
+
+    def _lookup_prob(action_name: str, target_state_name: str) -> float:
+        """
+        Read p(A -> target) from asc.actions[action_name] using probs_attr.
+        Supports both shapes:
+          A) probs[pre_state][post_state] = p  (we take MAX over rows)
+          B) probs[post_state] = p
+        """
+        a_obj = asc.actions[action_name]
+        probs = _get_action_probs_dict(a_obj)
+
+        # If target is a clone ("Base|a:..."/"|L:..."), use its base
+        base_target = target_state_name
+        if target_state_name in term_clones:
+            base_target = term_clones[target_state_name]["base"]
+
+        if not isinstance(probs, dict) or not probs:
+            return 0.0
+
+        # Nested shape?
+        if any(isinstance(v, dict) for v in probs.values()):
+            # take max across all pre_state rows for this target
+            best = None
+            for row in probs.values():
+                if isinstance(row, dict) and base_target in row and row[base_target] is not None:
+                    val = float(row[base_target])
+                    best = val if best is None else max(best, val)
+            return best if best is not None else 0.0
+        else:
+            # flat shape
+            val = probs.get(base_target, 0.0)
+            return float(val) if val is not None else 0.0
+
+    # ---- DEDUPE A->target edges (keep S->A as-is); recompute p via _lookup_prob ----
     edges_SA = []
-    acc = {}  # (A, target) -> p_max
+    acc = {}  # (A, target) -> p_max from chosen source
     for u, v, data in edges_raw:
         if (u in state_layers) and (v in action_layers):   # S->A
             edges_SA.append((u, v, {"p": None, "label": None}))
-        else:                                              # A->state/clone
-            p = float(data.get("p", 0.0))
+        else:                                              # A->target
+            p = _lookup_prob(u, v)
             key = (u, v)
             acc[key] = max(acc.get(key, p), p)
 
@@ -188,11 +231,12 @@ def draw_asc_flow_matplotlib(
     for _, (xL, y) in pos_clones.items():
         add_rect_extents(xnorm(xL), y)
 
-    # draw deduped edges
+    # draw (using recomputed/aggregated probabilities)
     for u, v, data in edges:
         x0, y0 = get_xy(u)
         x1, y1 = get_xy(v)
-        lw = 1.0 if data.get("p") is None else 1.0 + 3.0 * data["p"]
+        p = data.get("p")
+        lw = 1.0 if p is None else 1.0 + 3.0 * p  # width ~ chosen probability
         arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
               label=data.get("label"), lw=lw)
 
