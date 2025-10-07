@@ -1,23 +1,258 @@
-from types import SimpleNamespace
-from collections import defaultdict
+def draw_asc_flow_matplotlib(
+    asc,
+    start_state: str,
+    prob_threshold: float = 0.0,
+    terminal_clone_scope: str = "none",  # "none" | "action" | "layer"
+    which_terminals=None,
+    figsize=(12, 7),
+    title=None,
+    hscale: float = 1.6,
+    *,
+    # text styling
+    state_text_rotation: float = 0.0,
+    action_text_rotation: float = 0.0,
+    terminal_text_rotation: float = 0.0,
+    edge_label_rotation: "float|str|None" = "auto",   # "auto", number, or None
+    # edge-label overlap handling
+    edge_label_jitter_y: float = 0.03,
+    edge_label_jitter_mode: str = "hash",             # "hash" (stable) | "random"
+    edge_label_seed: int | None = None,
+    # dedupe aggregation for multiple A->target edges
+    action_edge_prob_agg: str = "max",                # "max"|"mean"|"min"|"first"|"last"
+    # in-layer ordering controls
+    state_swaps: list[tuple[str, str]] | None = None,
+    action_swaps: list[tuple[str, str]] | None = None,
+    state_order_hint: dict[str, float] | None = None,   # lower = higher (top)
+    action_order_hint: dict[str, float] | None = None,
+):
+    """
+    Draw an ASC flow graph with clean layering and labeling.
+    Assumes helpers `build_flow_layers` and (optionally) imports for matplotlib
+    patches are already present in your module.
+    """
+    from collections import defaultdict
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyArrowPatch, Rectangle, Circle
 
-def ascmdp_to_asc_like(ascmdp):
-    # 1) States with outgoing actions
-    states = {}
-    actions = {}
-    S = getattr(ascmdp, "states", range(ascmdp.no_states))
+    # --- sizes ---
+    RECT_W, RECT_H = 0.06, 0.09
+    CIRCLE_R = 0.035
+    LABEL_DY = 0.02
 
-    for s in S:
-        acts = list(ascmdp.actions_from_state(s))
-        states[s] = SimpleNamespace(actions=acts, is_terminal=(len(acts)==0))
+    # --- build ---
+    state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
+        asc,
+        start_state=start_state,
+        prob_threshold=prob_threshold,
+        terminal_clone_scope=terminal_clone_scope,
+        which_terminals=which_terminals,
+    )
 
-    # 2) Actions with probabilities in “shape A”: probs[pre_state][post_state] = p
-    for s in S:
-        for a in states[s].actions:
-            probs = actions.setdefault(a, SimpleNamespace(probabilities=defaultdict(dict))).probabilities
-            for s_prime, p in ascmdp.T(s, a).items():
-                # normalize terminal key for your drawer: keep None or use a label like "⟂"
-                probs[s][s_prime] = float(p)
+    # --- DEDUPE A->target edges (keep S->A as-is) ---
+    def _agg_update(cur, val):
+        if cur is None:
+            return val if action_edge_prob_agg != "mean" else (val, 1)
+        if action_edge_prob_agg == "max":   return max(cur, val)
+        if action_edge_prob_agg == "min":   return min(cur, val)
+        if action_edge_prob_agg == "last":  return val
+        if action_edge_prob_agg == "first": return cur
+        if action_edge_prob_agg == "mean":
+            s, n = (cur if isinstance(cur, tuple) else (cur, 1))
+            return (s + val, n + 1)
+        return max(cur, val)
 
-    asc_like = SimpleNamespace(states=states, actions=actions, start_state=next(iter(S)))
-    return asc_like
+    def _agg_finalize(val):
+        if isinstance(val, tuple):
+            s, n = val
+            return s / n if n else 0.0
+        return val
+
+    edges_SA = []
+    acc = {}  # (A, target) -> agg(p)
+    for u, v, data in edges_raw:
+        if (u in state_layers) and (v in action_layers):   # S->A
+            edges_SA.append((u, v, {"p": None, "label": None}))
+        else:                                              # A->state/clone
+            p = float(data.get("p", 0.0))
+            key = (u, v)
+            acc[key] = _agg_update(acc.get(key), p)
+
+    edges_AT = []
+    for (u, v), val in acc.items():
+        p = float(_agg_finalize(val))
+        edges_AT.append((u, v, {"p": p, "label": f"{p:.3f}"}))
+
+    edges = edges_SA + edges_AT
+
+    # --- local layout helper with order hints + swaps ---
+    def positions_by_layer(names, layer_map, *, order_hint=None, swap_pairs=None):
+        by_layer = defaultdict(list)
+        for n in names:
+            by_layer[layer_map[n]].append(n)
+        pos = {}
+        for L, nodes in by_layer.items():
+            # base order
+            ordered = sorted(nodes, key=lambda n: (order_hint.get(n, 0) if order_hint else 0, n))
+            # swap pairs (only if both in this layer)
+            if swap_pairs:
+                idx = {n: i for i, n in enumerate(ordered)}
+                for a, b in swap_pairs:
+                    if a in idx and b in idx and layer_map.get(a) == L and layer_map.get(b) == L:
+                        ia, ib = idx[a], idx[b]
+                        idx[a], idx[b] = ib, ia
+                ordered = sorted(nodes, key=lambda n: idx[n])
+            # y spacing [-1..1]
+            m = len(ordered)
+            ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
+            for n, y in zip(ordered, ys):
+                pos[n] = (L, y)
+        return pos
+
+    # names
+    clone_names = set(term_clones.keys())
+    state_names  = [s for s in state_layers if s not in clone_names]
+    action_names = list(action_layers.keys())
+
+    # base positions
+    pos_states = positions_by_layer(
+        state_names, state_layers,
+        order_hint=state_order_hint, swap_pairs=state_swaps
+    )
+    pos_actions = positions_by_layer(
+        action_names, action_layers,
+        order_hint=action_order_hint, swap_pairs=action_swaps
+    )
+
+    # normalize X to [0, hscale]
+    all_layers = list(state_layers.values()) + list(action_layers.values())
+    Lmin, Lmax = min(all_layers), max(all_layers)
+    def xnorm(L):
+        return 0.0 if Lmax == Lmin else ((L - Lmin) / (Lmax - Lmin)) * hscale
+
+    # clone positions (same even column as other post-states)
+    pos_clones = {}
+    if term_clones:
+        groups = defaultdict(list)  # ('action', a) or ('layer', L) -> clones
+        for clone, meta in term_clones.items():
+            groups[meta["scope"]].append(clone)
+
+        for (scope, key), clones in groups.items():
+            if scope == "action":
+                L_odd   = action_layers[key]
+                anchor_y = pos_actions[key][1]
+            else:  # "layer"
+                L_odd   = key
+                anchor_y = 0.0
+            target_even = L_odd + 1
+            step = 0.35
+            for i, clone in enumerate(clones):
+                cy = anchor_y - step * (i + 1 if len(clones) > 1 else 1)
+                pos_clones[clone] = (target_even, cy)
+
+    # jitter helper
+    rng = np.random.default_rng(edge_label_seed)
+    def jitter_from_key(key):
+        if edge_label_jitter_y <= 0:
+            return 0.0
+        if edge_label_jitter_mode == "random":
+            return rng.uniform(-edge_label_jitter_y, edge_label_jitter_y)
+        b = repr(key).encode("utf-8")
+        h = int.from_bytes(hashlib.blake2b(b, digest_size=8).digest(), "big")
+        u = h / (2**64 - 1)
+        return (u * 2 - 1) * edge_label_jitter_y
+
+    # --- draw ---
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    ax.axis("off")
+    if title:
+        ax.set_title(title)
+
+    # states
+    for s in state_names:
+        xL, y = pos_states[s]
+        x = xnorm(xL)
+        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
+        ax.text(x, y + RECT_H/2 + LABEL_DY, s, fontsize=9, ha="center", va="bottom",
+                rotation=state_text_rotation, rotation_mode="anchor")
+
+    # actions
+    for a in action_names:
+        xL, y = pos_actions[a]
+        x = xnorm(xL)
+        ax.add_patch(Circle((x, y), CIRCLE_R, ec="black", fc="lightgrey"))
+        ax.text(x, y + CIRCLE_R + LABEL_DY, a, fontsize=9, ha="center", va="bottom",
+                rotation=action_text_rotation, rotation_mode="anchor")
+
+    # clones
+    for clone, (cxL, cy) in pos_clones.items():
+        x = xnorm(cxL)
+        base = term_clones[clone]["base"]
+        ax.add_patch(Rectangle((x - RECT_W/2, cy - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
+        ax.text(x, cy + RECT_H/2 + LABEL_DY, base, fontsize=9, ha="center", va="bottom",
+                rotation=terminal_text_rotation, rotation_mode="anchor")
+
+    # arrows + labels
+    def arrow(xy0, xy1, label=None, lw=1.0, key=None):
+        ax.add_patch(FancyArrowPatch(xy0, xy1, arrowstyle="-|>", lw=lw, color="black", mutation_scale=20))
+        if label:
+            xm = (xy0[0] + xy1[0]) / 2
+            ym = (xy0[1] + xy1[1]) / 2
+            # rotation
+            if isinstance(edge_label_rotation, (int, float)):
+                rot = float(edge_label_rotation)
+            elif edge_label_rotation == "auto":
+                rot = np.degrees(np.arctan2(xy1[1] - xy0[1], xy1[0] - xy0[0]))
+                if rot < -90 or rot > 90:
+                    rot += 180
+            else:
+                rot = 0.0
+            # jitter
+            jy = jitter_from_key(key)
+            ax.annotate(label, (xm, ym + jy), xytext=(0, 4), textcoords="offset points",
+                        fontsize=8, ha="center", va="bottom",
+                        rotation=rot, rotation_mode="anchor", clip_on=False)
+
+    def get_xy(node):
+        if node in pos_states:
+            xL, y = pos_states[node]
+        elif node in pos_actions:
+            xL, y = pos_actions[node]
+        else:
+            xL, y = pos_clones[node]
+        return (xnorm(xL), y)
+
+    START_OFFSET = 0.05
+    END_OFFSET   = 0.05
+
+    # collect extents for autoscale
+    xs, ys = [], []
+    def add_rect_extents(x, y):
+        xs.extend([x - RECT_W/2, x + RECT_W/2])
+        ys.extend([y - RECT_H/2 - 0.02, y + RECT_H/2 + LABEL_DY + 0.02])
+    def add_circle_extents(x, y):
+        xs.extend([x - CIRCLE_R, x + CIRCLE_R])
+        ys.extend([y - CIRCLE_R - 0.02, y + CIRCLE_R + LABEL_DY + 0.02])
+
+    for _, (xL, y) in pos_states.items():
+        add_rect_extents(xnorm(xL), y)
+    for _, (xL, y) in pos_actions.items():
+        add_circle_extents(xnorm(xL), y)
+    for _, (xL, y) in pos_clones.items():
+        add_rect_extents(xnorm(xL), y)
+
+    # draw deduped edges
+    for u, v, data in edges:
+        x0, y0 = get_xy(u)
+        x1, y1 = get_xy(v)
+        lw = 1.0 if data.get("p") is None else 1.0 + 3.0 * data["p"]
+        arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
+              label=data.get("label"), lw=lw, key=(u, v))
+
+    # dynamic bounds to avoid clipping
+    if xs and ys:
+        pad_x, pad_y = 0.06, 0.10
+        ax.set_xlim(min(xs) - pad_x, max(xs) + pad_x)
+        ax.set_ylim(min(ys) - pad_y, max(ys) + pad_y)
+    ax.margins(x=0.02, y=0.04)
+
+    return fig, ax
