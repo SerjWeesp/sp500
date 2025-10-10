@@ -4,29 +4,37 @@ from typing import Any, Dict, Iterable, Optional
 
 def build_transition_table_mixed_sources(
     asc_main,                      # states, actions, probabilities
-    asc_rewards,                   # SAME action names; rewards & rewards_dev only
+    asc_rewards,                   # rewards + rewards_dev only
     *,
     prob_threshold: float = 0.0,
     probs_attr: str = "auto",      # "auto" | "real" | "model"
+    # optional filters if you want later to control width:
+    include_only: Optional[Iterable[str]] = None,  # keep only these action attrs (names)
+    exclude: Optional[Iterable[str]] = None,       # drop these action attrs (names)
 ) -> pd.DataFrame:
     """
-    Create one row per (pre_state --action--> post_state).
-
-    - Probabilities and all structural info (states, from_states, etc.) are
-      taken from asc_main.
-    - reward / reward_dev are taken from asc_rewards (if an action is missing
-      there, we fall back to asc_main for that action only).
-
-    Returns a DataFrame with:
-      action_name, action_from_state, action_to_state, prob, reward, reward_dev,
-      is_terminal, plus some action attributes from asc_main (name-prefixed).
+    One row per (pre_state --action--> post_state).
+    Probabilities & topology -> asc_main; rewards/rewards_dev -> asc_rewards.
     """
 
-    # ---------------- helpers ----------------
-    def action_public_attrs(a: Any) -> Dict[str, Any]:
-        out = {}
+    # ---------- helpers ----------
+    def action_public_attrs(a: Any,
+                            prefix: str = "action_",
+                            include_only: Optional[Iterable[str]] = None,
+                            exclude: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        """
+        Collect ALL non-callable, non-private attributes from the action
+        (including dicts/lists/objects) and prefix their column names.
+        """
+        excl = set(exclude or ())
+        inc  = set(include_only or ())
+        out: Dict[str, Any] = {}
         for k in dir(a):
             if k.startswith("_"):
+                continue
+            if include_only and k not in inc:
+                continue
+            if k in excl:
                 continue
             try:
                 v = getattr(a, k)
@@ -34,8 +42,7 @@ def build_transition_table_mixed_sources(
                 continue
             if callable(v):
                 continue
-            if isinstance(v, (str, int, float, bool, type(None))):
-                out[f"action_{k}"] = v
+            out[f"{prefix}{k}"] = v
         return out
 
     def from_states_for_action(asc_obj, a_obj) -> Iterable[str]:
@@ -50,7 +57,6 @@ def build_transition_table_mixed_sources(
             return True
         if not getattr(st, "actions", []):
             return True
-        # if a state never appears in any action.from_states, treat as terminal
         for _a, _ao in asc_obj.actions.items():
             fs = getattr(_ao, "from_states", None)
             if fs and s in fs:
@@ -66,11 +72,9 @@ def build_transition_table_mixed_sources(
         return rp if rp else (getattr(a, "probabilities", {}) or {})
 
     def iter_successors(a_obj, pre_state=None):
-        """Yield (post, p) from asc_main using the selected probs source."""
         probs = pick_probs_dict(a_obj)
         if not isinstance(probs, dict):
             return
-        # nested by pre_state?
         if probs and any(isinstance(v, dict) for v in probs.values()):
             row = probs.get(pre_state, {}) if pre_state is not None else {}
             for post, p in row.items():
@@ -82,44 +86,36 @@ def build_transition_table_mixed_sources(
                     yield post, float(p)
 
     def lookup_reward(a_rewards_obj, pre_state, post_state, key: str) -> Optional[float]:
-        """
-        key: 'rewards' or 'rewards_dev'
-        Returns float or None.
-        """
         src = getattr(a_rewards_obj, key, None)
         if not isinstance(src, dict):
             return None
-        # unwrap clones: if post_state looks like 'Base|a:...' or '|L:...' keep base
         base_post = post_state.split("|")[0] if "|" in post_state else post_state
         if src and any(isinstance(v, dict) for v in src.values()):
             return float(src.get(pre_state, {}).get(base_post, 0.0))
         return float(src.get(base_post, 0.0))
 
-    # --------------- main loop ---------------
+    # ---------- main ----------
     rows = []
     for a_name, a_main in asc_main.actions.items():
-        a_attrs = action_public_attrs(a_main)
-
+        # attributes from asc_main (ALL public attrs)
+        a_attrs = action_public_attrs(
+            a_main, prefix="action_",
+            include_only=include_only, exclude=exclude
+        )
         # rewards source for this action
         aR = (asc_rewards.actions.get(a_name) if asc_rewards else None) or a_main
 
         for s in from_states_for_action(asc_main, a_main):
             for s_prime, p in iter_successors(a_main, pre_state=s):
-                prob = float(p)
-
-                # rewards/rewards_dev strictly from asc_rewards (fallback to main)
-                reward     = lookup_reward(aR, s, s_prime, "rewards")
-                reward_dev = lookup_reward(aR, s, s_prime, "rewards_dev")
-
                 rows.append({
                     "action_name":       a_name,
                     "action_from_state": s,
                     "action_to_state":   s_prime,
-                    "prob":              prob,
-                    "reward":            reward,
-                    "reward_dev":        reward_dev,
+                    "prob":              float(p),
+                    "reward":            lookup_reward(aR, s, s_prime, "rewards"),
+                    "reward_dev":        lookup_reward(aR, s, s_prime, "rewards_dev"),
                     "is_terminal":       is_terminal_state(asc_main, s_prime),
-                    **a_attrs,  # optional action attributes (from asc_main)
+                    **a_attrs,  # <- all public attrs from asc_main
                 })
 
     return pd.DataFrame(rows)
