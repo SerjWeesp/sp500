@@ -1,336 +1,125 @@
-from collections import defaultdict, deque
-from typing import Dict, Tuple, List, Any, Optional
-import math
-import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch, Rectangle, Circle
+import pandas as pd
+from typing import Any, Dict, Iterable, Optional
 
 
-# -------------------- 1) Successor iterator (uses model probs) --------------------
-def iter_action_successors(action_obj, pre_state=None, prob_threshold: float = 0.0):
-    """
-    Yield (post_state, p) for a given action using action.probabilities.
-    Supports two shapes:
-      A) probabilities[pre_state][post_state] = p
-      B) probabilities[post_state] = p
-    Keeps edges where p >= prob_threshold (so 0.0 passes if threshold==0.0).
-    """
-    probs = getattr(action_obj, "probabilities", {}) or {}
-
-    # shape A?
-    if any(isinstance(v, dict) for v in probs.values()):
-        row = probs.get(pre_state, {}) if pre_state is not None else {}
-        for post_s, p in row.items():
-            if p is not None and float(p) >= prob_threshold:
-                yield post_s, float(p)
-    else:
-        # shape B
-        for post_s, p in probs.items():
-            if p is not None and float(p) >= prob_threshold:
-                yield post_s, float(p)
-
-
-# -------------------- 2) Layer builder --------------------
-def build_flow_layers(
-    asc,
-    start_state: str,
+def build_transition_table_mixed_sources(
+    asc_main,                      # states, actions, probabilities
+    asc_rewards,                   # SAME action names; rewards & rewards_dev only
+    *,
     prob_threshold: float = 0.0,
-    terminal_clone_scope: str = "none",   # "none" | "action" | "layer"
-    which_terminals=None,                 # set[str] or None
-):
+    probs_attr: str = "auto",      # "auto" | "real" | "model"
+) -> pd.DataFrame:
     """
-    Build layered graph pieces for drawing.
+    Create one row per (pre_state --action--> post_state).
 
-    Returns:
-      state_layers: dict[node_name -> even layer index]
-      action_layers: dict[action_name -> odd layer index]
-      edges: list[(u, v, {"p": float|None, "label": str|None})]
-             (S->A unlabeled; A->target labeled)
-      term_clones: dict[clone_name -> {"base": base_state,
-                                       "scope": ("action", action) or ("layer", odd_layer)}]
+    - Probabilities and all structural info (states, from_states, etc.) are
+      taken from asc_main.
+    - reward / reward_dev are taken from asc_rewards (if an action is missing
+      there, we fall back to asc_main for that action only).
+
+    Returns a DataFrame with:
+      action_name, action_from_state, action_to_state, prob, reward, reward_dev,
+      is_terminal, plus some action attributes from asc_main (name-prefixed).
     """
-    if start_state not in asc.states:
-        raise ValueError(f"start_state {start_state!r} not found in asc.states")
-    if terminal_clone_scope not in {"none", "action", "layer"}:
-        raise ValueError("terminal_clone_scope must be 'none', 'action', or 'layer'.")
 
-    # helpers
-    def all_from_states(asc_obj):
-        s = set()
-        for _a, a_obj in getattr(asc_obj, "actions", {}).items():
-            fs = getattr(a_obj, "from_states", None)
-            if fs:
-                s.update(fs)
-        return s
+    # ---------------- helpers ----------------
+    def action_public_attrs(a: Any) -> Dict[str, Any]:
+        out = {}
+        for k in dir(a):
+            if k.startswith("_"):
+                continue
+            try:
+                v = getattr(a, k)
+            except Exception:
+                continue
+            if callable(v):
+                continue
+            if isinstance(v, (str, int, float, bool, type(None))):
+                out[f"action_{k}"] = v
+        return out
 
-    def is_terminal_state(asc_obj, state_name, from_states_cache=None):
-        st = asc_obj.states.get(state_name)
+    def from_states_for_action(asc_obj, a_obj) -> Iterable[str]:
+        fs = getattr(a_obj, "from_states", None)
+        return list(fs) if fs else list(asc_obj.states.keys())
+
+    def is_terminal_state(asc_obj, s: str) -> bool:
+        st = asc_obj.states.get(s)
         if st is None:
             return True
         if getattr(st, "is_terminal", False):
             return True
         if not getattr(st, "actions", []):
             return True
-        if from_states_cache is not None and state_name not in from_states_cache:
-            return True
-        return False
+        # if a state never appears in any action.from_states, treat as terminal
+        for _a, _ao in asc_obj.actions.items():
+            fs = getattr(_ao, "from_states", None)
+            if fs and s in fs:
+                return False
+        return True
 
-    from_states_cache = all_from_states(asc)
-
-    state_layers: Dict[str, int] = {start_state: 0}   # even columns
-    action_layers: Dict[str, int] = {}                # odd columns
-    edges: List[Tuple[str, str, Dict[str, Any]]] = []
-    term_clones: Dict[str, Dict[str, Any]] = {}
-
-    q = deque([start_state])
-
-    while q:
-        s = q.popleft()
-        s_layer = state_layers[s]  # even column
-        s_obj = asc.states[s]
-
-        for a in getattr(s_obj, "actions", []):
-            # S -> A (unlabeled)
-            edges.append((s, a, {"p": None, "label": None}))
-            action_layers.setdefault(a, s_layer + 1)  # odd column next to S
-
-            a_obj = asc.actions[a]
-            for s_prime, p in iter_action_successors(
-                a_obj, pre_state=s, prob_threshold=prob_threshold
-            ):
-                terminal = is_terminal_state(asc, s_prime, from_states_cache)
-
-                clone_this = (
-                    terminal
-                    and terminal_clone_scope in {"action", "layer"}
-                    and (which_terminals is None or s_prime in which_terminals)
-                )
-
-                if clone_this:
-                    if terminal_clone_scope == "action":
-                        # one clone per (terminal, action)
-                        clone_name = f"{s_prime}|a:{a}"
-                        clone_meta = {"base": s_prime, "scope": ("action", a)}
-                        target_even = action_layers[a] + 1
-                    else:  # "layer": one clone per (terminal, action-layer)
-                        L = action_layers[a]  # odd
-                        clone_name = f"{s_prime}|L:{L}"
-                        clone_meta = {"base": s_prime, "scope": ("layer", L)}
-                        target_even = L + 1   # even
-
-                    if clone_name not in term_clones:
-                        term_clones[clone_name] = clone_meta
-                        state_layers.setdefault(clone_name, target_even)
-
-                    edges.append((a, clone_name, {"p": float(p), "label": f"{p:.3f}"}))
-
-                else:
-                    edges.append((a, s_prime, {"p": float(p), "label": f"{p:.3f}"}))
-                    if s_prime not in state_layers:
-                        state_layers[s_prime] = s_layer + 2
-                        q.append(s_prime)
-
-    return state_layers, action_layers, edges, term_clones
-
-
-# -------------------- 3) Drawer (chooses real/model probs; dedup; packed layers) --------------------
-def draw_asc_flow_matplotlib(
-    asc,
-    start_state: str,
-    prob_threshold: float = 0.0,
-    terminal_clone_scope: str = "none",      # "none" | "action" | "layer"
-    which_terminals=None,
-    figsize=(12, 7),
-    title: Optional[str] = None,
-    hscale: float = 1.6,
-    *,
-    probs_attr: str = "auto",                # "auto" | "real" | "model"
-    state_text_rotation: float = 0.0,
-    action_text_rotation: float = 0.0,
-    terminal_text_rotation: float = 0.0,
-    edge_label_rotation: "float|str|None" = "auto",
-):
-    """
-    Draw an ASC flow chart.
-
-    - Uses build_flow_layers() above (model probs for reachability),
-      then recomputes A->target probabilities here based on `probs_attr`
-      for labels and line widths.
-    - Deduplicates A->target edges with MAX aggregation.
-    - Packs real states + clones together per even layer (no overlap/bunching).
-    """
-    # sizes
-    RECT_W, RECT_H = 0.06, 0.09
-    CIRCLE_R = 0.035
-    LABEL_DY = 0.02
-
-    # build skeleton
-    state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
-        asc,
-        start_state=start_state,
-        prob_threshold=prob_threshold,
-        terminal_clone_scope=terminal_clone_scope,
-        which_terminals=which_terminals,
-    )
-
-    # probability reader (auto/real/model)
-    def _get_probs_dict(a_obj):
+    def pick_probs_dict(a) -> Dict[str, Any]:
         if probs_attr == "real":
-            return getattr(a_obj, "real_probabilities", {}) or {}
+            return getattr(a, "real_probabilities", {}) or {}
         if probs_attr == "model":
-            return getattr(a_obj, "probabilities", {}) or {}
-        rp = getattr(a_obj, "real_probabilities", None)
-        return rp if rp else (getattr(a_obj, "probabilities", {}) or {})
+            return getattr(a, "probabilities", {}) or {}
+        rp = getattr(a, "real_probabilities", None)
+        return rp if rp else (getattr(a, "probabilities", {}) or {})
 
-    def _lookup_prob(action_name: str, target_name: str) -> float:
-        a_obj = asc.actions[action_name]
-        probs = _get_probs_dict(a_obj)
-        target = term_clones[target_name]["base"] if target_name in term_clones else target_name
-        if not isinstance(probs, dict) or not probs:
-            return 0.0
-        if any(isinstance(v, dict) for v in probs.values()):
-            best = None
-            for row in probs.values():
-                if isinstance(row, dict) and target in row and row[target] is not None:
-                    val = float(row[target])
-                    best = val if best is None else max(best, val)
-            return 0.0 if best is None else best
-        val = probs.get(target, 0.0)
-        return float(val) if val is not None else 0.0
-
-    # dedupe A->target, recomputing p from chosen source
-    edges_SA = []
-    acc = {}  # (A, target) -> max p
-    for u, v, _data in edges_raw:
-        if (u in state_layers) and (v in action_layers):
-            edges_SA.append((u, v, {"p": None, "label": None}))
+    def iter_successors(a_obj, pre_state=None):
+        """Yield (post, p) from asc_main using the selected probs source."""
+        probs = pick_probs_dict(a_obj)
+        if not isinstance(probs, dict):
+            return
+        # nested by pre_state?
+        if probs and any(isinstance(v, dict) for v in probs.values()):
+            row = probs.get(pre_state, {}) if pre_state is not None else {}
+            for post, p in row.items():
+                if p is not None and float(p) >= prob_threshold:
+                    yield post, float(p)
         else:
-            p = _lookup_prob(u, v)
-            acc[(u, v)] = max(acc.get((u, v), p), p)
-    edges_AT = [(u, v, {"p": float(p), "label": f"{p:.3f}"}) for (u, v), p in acc.items()]
-    edges = edges_SA + edges_AT
+            for post, p in probs.items():
+                if p is not None and float(p) >= prob_threshold:
+                    yield post, float(p)
 
-    # layout helpers
-    def positions_by_layer(names, layer_map):
-        by_layer = defaultdict(list)
-        for n in names:
-            by_layer[layer_map[n]].append(n)
-        pos = {}
-        for L, nodes in by_layer.items():
-            nodes = sorted(nodes)
-            m = len(nodes)
-            ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
-            for n, y in zip(nodes, ys):
-                pos[n] = (L, y)
-        return pos
+    def lookup_reward(a_rewards_obj, pre_state, post_state, key: str) -> Optional[float]:
+        """
+        key: 'rewards' or 'rewards_dev'
+        Returns float or None.
+        """
+        src = getattr(a_rewards_obj, key, None)
+        if not isinstance(src, dict):
+            return None
+        # unwrap clones: if post_state looks like 'Base|a:...' or '|L:...' keep base
+        base_post = post_state.split("|")[0] if "|" in post_state else post_state
+        if src and any(isinstance(v, dict) for v in src.values()):
+            return float(src.get(pre_state, {}).get(base_post, 0.0))
+        return float(src.get(base_post, 0.0))
 
-    # actions (odd) spread
-    action_names = list(action_layers.keys())
-    pos_actions = positions_by_layer(action_names, action_layers)
+    # --------------- main loop ---------------
+    rows = []
+    for a_name, a_main in asc_main.actions.items():
+        a_attrs = action_public_attrs(a_main)
 
-    # pack real states + clones together per even layer
-    clone_names = set(term_clones.keys())
-    state_names = [s for s in state_layers if s not in clone_names]
+        # rewards source for this action
+        aR = (asc_rewards.actions.get(a_name) if asc_rewards else None) or a_main
 
-    layer_to_items = defaultdict(list)
-    for s in state_names:
-        layer_to_items[state_layers[s]].append(("state", s))
-    for c in clone_names:
-        layer_to_items[state_layers[c]].append(("clone", c))
+        for s in from_states_for_action(asc_main, a_main):
+            for s_prime, p in iter_successors(a_main, pre_state=s):
+                prob = float(p)
 
-    pos_states, pos_clones = {}, {}
-    for L, items in layer_to_items.items():
-        items = sorted(items, key=lambda t: (t[0] != "state", t[1]))  # states first, then clones
-        m = len(items)
-        ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
-        for (kind, name), y in zip(items, ys):
-            if kind == "state":
-                pos_states[name] = (L, y)
-            else:
-                pos_clones[name] = (L, y)
+                # rewards/rewards_dev strictly from asc_rewards (fallback to main)
+                reward     = lookup_reward(aR, s, s_prime, "rewards")
+                reward_dev = lookup_reward(aR, s, s_prime, "rewards_dev")
 
-    # normalize x to [0, hscale]
-    all_layers = list(state_layers.values()) + list(action_layers.values())
-    Lmin, Lmax = min(all_layers), max(all_layers)
-    def xnorm(L):
-        return 0.0 if Lmax == Lmin else ((L - Lmin) / (Lmax - Lmin)) * hscale
+                rows.append({
+                    "action_name":       a_name,
+                    "action_from_state": s,
+                    "action_to_state":   s_prime,
+                    "prob":              prob,
+                    "reward":            reward,
+                    "reward_dev":        reward_dev,
+                    "is_terminal":       is_terminal_state(asc_main, s_prime),
+                    **a_attrs,  # optional action attributes (from asc_main)
+                })
 
-    # draw
-    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-    ax.axis("off")
-    if title:
-        ax.set_title(title)
-
-    # states
-    for s in state_names:
-        xL, y = pos_states[s]; x = xnorm(xL)
-        ax.add_patch(Rectangle((x - 0.03, y - 0.045), 0.06, 0.09, ec="black", fc="white"))
-        ax.text(x, y + 0.09/2 + 0.02, s, fontsize=9, ha="center", va="bottom",
-                rotation=state_text_rotation, rotation_mode="anchor")
-
-    # actions
-    for a in action_names:
-        xL, y = pos_actions[a]; x = xnorm(xL)
-        ax.add_patch(Circle((x, y), 0.035, ec="black", fc="lightgrey"))
-        ax.text(x, y + 0.035 + 0.02, a, fontsize=9, ha="center", va="bottom",
-                rotation=action_text_rotation, rotation_mode="anchor")
-
-    # clones (label with base name)
-    for clone, (xL, y) in pos_clones.items():
-        x = xnorm(xL)
-        base = term_clones[clone]["base"]
-        ax.add_patch(Rectangle((x - 0.03, y - 0.045), 0.06, 0.09, ec="black", fc="white"))
-        ax.text(x, y + 0.09/2 + 0.02, base, fontsize=9, ha="center", va="bottom",
-                rotation=terminal_text_rotation, rotation_mode="anchor")
-
-    # edges
-    def arrow(xy0, xy1, label=None, lw=1.0):
-        ax.add_patch(FancyArrowPatch(xy0, xy1, arrowstyle="-|>", lw=lw, color="black", mutation_scale=20))
-        if label:
-            xm = (xy0[0] + xy1[0]) / 2; ym = (xy0[1] + xy1[1]) / 2
-            if isinstance(edge_label_rotation, (int, float)):
-                rot = float(edge_label_rotation)
-            elif edge_label_rotation == "auto":
-                rot = math.degrees(math.atan2(xy1[1] - xy0[1], xy1[0] - xy0[0]))
-                if rot < -90 or rot > 90: rot += 180
-            else:
-                rot = 0.0
-            ax.annotate(label, (xm, ym), xytext=(0, 4), textcoords="offset points",
-                        fontsize=8, ha="center", va="bottom",
-                        rotation=rot, rotation_mode="anchor", clip_on=False)
-
-    def get_xy(node):
-        if node in pos_states:
-            xL, y = pos_states[node]
-        elif node in pos_actions:
-            xL, y = pos_actions[node]
-        else:
-            xL, y = pos_clones[node]
-        return (xnorm(xL), y)
-
-    START_OFFSET, END_OFFSET = 0.05, 0.05
-
-    # draw deduped edges
-    for u, v, data in edges:
-        x0, y0 = get_xy(u); x1, y1 = get_xy(v)
-        p = data.get("p"); lw = 1.0 if p is None else 1.0 + 3.0 * p
-        arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
-              label=data.get("label"), lw=lw)
-
-    # dynamic limits
-    xs, ys = [], []
-    def add_rect_extents(x, y):
-        xs.extend([x - 0.03, x + 0.03]); ys.extend([y - 0.045 - 0.02, y + 0.045 + 0.02])
-    def add_circle_extents(x, y):
-        xs.extend([x - 0.035, x + 0.035]); ys.extend([y - 0.035 - 0.02, y + 0.035 + 0.02])
-
-    for _, (xL, y) in pos_states.items():  add_rect_extents(xnorm(xL), y)
-    for _, (xL, y) in pos_actions.items(): add_circle_extents(xnorm(xL), y)
-    for _, (xL, y) in pos_clones.items():  add_rect_extents(xnorm(xL), y)
-
-    if xs and ys:
-        pad_x, pad_y = 0.06, 0.10
-        ax.set_xlim(min(xs) - pad_x, max(xs) + pad_x)
-        ax.set_ylim(min(ys) - pad_y, max(ys) + pad_y)
-    ax.margins(x=0.02, y=0.04)
-
-    return fig, ax
+    return pd.DataFrame(rows)
