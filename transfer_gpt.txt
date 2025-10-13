@@ -134,7 +134,7 @@ def build_flow_layers(
     return state_layers, action_layers, edges, term_clones
 
 
-# 3) Drawer (adds robust arrow annotations at 60% along the path)
+# 3) Drawer (ONLY annotation logic changed; rest kept as-is)
 def draw_asc_flow_matplotlib_wide(
     asc,
     start_state: str,
@@ -151,13 +151,6 @@ def draw_asc_flow_matplotlib_wide(
     terminal_text_rotation: float = 0.0,
     edge_label_rotation: "float|str|None" = "auto",
 ):
-    """
-    Draw an ASC flow chart and annotate A→target edges.
-    Only the annotation behavior is changed vs your current version:
-      • if data['label'] is missing but p is present, we synthesize a label from p;
-      • label is placed at 60% of the (possibly curved) arrow path;
-      • label auto-rotates with the path unless you set edge_label_rotation to a number.
-    """
     # sizes
     RECT_W, RECT_H = 0.06, 0.09
     CIRCLE_R = 0.035
@@ -172,15 +165,6 @@ def draw_asc_flow_matplotlib_wide(
         which_terminals=which_terminals,
     )
 
-    # probability reader (auto/real/model) — used only if you later want to recompute p
-    def _get_probs_dict(a_obj):
-        if probs_attr == "real":
-            return getattr(a_obj, "real_probabilities", {}) or {}
-        if probs_attr == "model":
-            return getattr(a_obj, "probabilities", {}) or {}
-        rp = getattr(a_obj, "real_probabilities", None)
-        return rp if rp else (getattr(a_obj, "probabilities", {}) or {})
-
     # dedupe A→target; keep S→A unchanged
     edges_SA = []
     acc = {}  # (A, T) -> max p
@@ -188,9 +172,8 @@ def draw_asc_flow_matplotlib_wide(
         if (u in state_layers) and (v in action_layers):
             edges_SA.append((u, v, {"p": None, "label": None}))
         else:
-            p = data.get("p", 0.0)
             try:
-                p = float(p)
+                p = float(data.get("p", 0.0))
             except (TypeError, ValueError):
                 p = 0.0
             acc[(u, v)] = max(acc.get((u, v), p), p)
@@ -227,7 +210,7 @@ def draw_asc_flow_matplotlib_wide(
 
     pos_states, pos_clones = {}, {}
     for L, items in layer_to_items.items():
-        items = sorted(items, key=lambda t: (t[0] != "state", t[1]))  # states first, then clones
+        items = sorted(items, key=lambda t: (t[0] != "state", t[1]))  # states first
         m = len(items)
         ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
         for (kind, name), y in zip(items, ys):
@@ -247,27 +230,27 @@ def draw_asc_flow_matplotlib_wide(
     if title:
         ax.set_title(title)
 
-    # draw nodes (outside labels kept as you had)
+    # draw nodes (kept outside labels as in your version)
     for s in state_names:
         xL, y = pos_states[s]; x = xnorm(xL)
-        ax.add_patch(Rectangle((x - 0.03, y - 0.045), 0.06, 0.09, ec="black", fc="white"))
-        ax.text(x, y + 0.09/2 + LABEL_DY, s, fontsize=9, ha="center", va="bottom",
+        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
+        ax.text(x, y + RECT_H/2 + LABEL_DY, s, fontsize=9, ha="center", va="bottom",
                 rotation=state_text_rotation, rotation_mode="anchor")
 
     for a in action_names:
         xL, y = pos_actions[a]; x = xnorm(xL)
-        ax.add_patch(Circle((x, y), 0.035, ec="black", fc="lightgrey"))
-        ax.text(x, y + 0.035 + LABEL_DY, a, fontsize=9, ha="center", va="bottom",
+        ax.add_patch(Circle((x, y), CIRCLE_R, ec="black", fc="lightgrey"))
+        ax.text(x, y + CIRCLE_R + LABEL_DY, a, fontsize=9, ha="center", va="bottom",
                 rotation=action_text_rotation, rotation_mode="anchor")
 
     for clone, (xL, y) in pos_clones.items():
         x = xnorm(xL)
         base = term_clones[clone]["base"]
-        ax.add_patch(Rectangle((x - 0.03, y - 0.045), 0.06, 0.09, ec="black", fc="white"))
-        ax.text(x, y + 0.09/2 + LABEL_DY, base, fontsize=9, ha="center", va="bottom",
+        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
+        ax.text(x, y + RECT_H/2 + LABEL_DY, base, fontsize=9, ha="center", va="bottom",
                 rotation=terminal_text_rotation, rotation_mode="anchor")
 
-    # ---------- annotation helpers (NEW) ----------
+    # ---------- ONLY the arrow/label logic below is new/corrected ----------
     def _safe_prob(val: float) -> float:
         """None/NaN/±inf → 0; clamp to [0,1]."""
         try:
@@ -280,42 +263,14 @@ def draw_asc_flow_matplotlib_wide(
         if p > 1.0: p = 1.0
         return p
 
-    def _point_and_angle_on_path(patch, frac: float):
-        """Return (x,y) and angle (deg) at 'frac' along a FancyArrowPatch path."""
-        path = patch.get_path().transformed(patch.get_transform())
-        V = path.vertices
-        if V.shape[0] < 2:
-            return (V[-1, 0], V[-1, 1]), 0.0
-        seg = ( (V[1:,0]-V[:-1,0])**2 + (V[1:,1]-V[:-1,1])**2 )**0.5
-        if not (seg > 0).any():
-            return (V[-1, 0], V[-1, 1]), 0.0
-        cum = [0.0]
-        for s in seg: cum.append(cum[-1] + float(s))
-        L = cum[-1]; s_target = max(0.0, min(1.0, frac)) * L
-        i = max(0, min(len(seg)-1, next((k for k,c in enumerate(cum) if c > s_target), len(seg)) - 1))
-        if seg[i] == 0:
-            x, y = V[i]; dx, dy = 1.0, 0.0
-        else:
-            t = (s_target - cum[i]) / seg[i]
-            x = (1-t)*V[i,0] + t*V[i+1,0]
-            y = (1-t)*V[i,1] + t*V[i+1,1]
-            dx = V[i+1,0] - V[i,0]; dy = V[i+1,1] - V[i,1]
-        ang = math.degrees(math.atan2(dy, dx))
-        if ang < -90 or ang > 90: ang += 180
-        return (x, y), ang
-
-    def arrow(xy0, xy1, label=None, lw=1.0, linestyle="-"):
-        """Draw arrow and (NEW) place its label at 60% of path with proper rotation."""
+    def arrow(xy0, xy1, *, label=None, lw=1.0, linestyle="-"):
+        """
+        Draw arrow and label it like the WORKING code:
+          • label at the **midpoint of the straight chord**;
+          • angle from chord slope (atan2), flipped to keep text upright;
+          • label shown even for p==0.0 (we test label is not None).
+        """
         x0, y0 = xy0; x1, y1 = xy1
-        dx, dy = (x1 - x0), (y1 - y0)
-
-        # gentle bend if pointing left
-        if dx < -0.02:
-            sgn = 1 if dy >= 0 else -1
-            conn = f"arc3,rad={sgn * 0.18}"
-        else:
-            conn = "arc3,rad=0"
-
         patch = FancyArrowPatch(
             xy0, xy1,
             arrowstyle="-|>",
@@ -325,36 +280,38 @@ def draw_asc_flow_matplotlib_wide(
             linestyle=linestyle,
             capstyle="butt",
             joinstyle="miter",
-            connectionstyle=conn,
         )
         ax.add_patch(patch)
 
-        # (NEW) robust label
+        # show labels even when value is 0.0
         if label is not None:
-            # allow numeric labels (e.g., 0.0) — convert to string
-            if not isinstance(label, str):
-                try:
-                    label = f"{float(label):.3f}"
-                except Exception:
-                    label = str(label)
+            # synthesize string if label is numeric
+            try:
+                label_str = f"{float(label):.3f}"
+            except Exception:
+                label_str = str(label)
 
-            (xm, ym), auto_ang = _point_and_angle_on_path(patch, 0.60)
+            # midpoint + angle like the original working code
+            xm = (x0 + x1) / 2.0
+            ym = (y0 + y1) / 2.0
+
             if isinstance(edge_label_rotation, (int, float)):
                 rot = float(edge_label_rotation)
             elif edge_label_rotation == "auto":
-                rot = auto_ang
+                rot = math.degrees(math.atan2(y1 - y0, x1 - x0))
+                if rot < -90 or rot > 90:
+                    rot += 180
             else:
                 rot = 0.0
 
             ax.annotate(
-                label, (xm, ym),
+                label_str, (xm, ym),
                 xytext=(0, 4), textcoords="offset points",
                 fontsize=8, ha="center", va="bottom",
                 rotation=rot, rotation_mode="anchor",
-                clip_on=False
+                clip_on=False, zorder=5
             )
 
-    # where to place the arrow shafts
     def get_xy(node):
         if node in pos_states:
             xL, y = pos_states[node]
@@ -368,7 +325,8 @@ def draw_asc_flow_matplotlib_wide(
 
     # draw deduped edges
     for u, v, data in edges:
-        x0, y0 = get_xy(u); x1, y1 = get_xy(v)
+        x0, y0 = get_xy(u)
+        x1, y1 = get_xy(v)
 
         p = data.get("p")
         lw = 1.0 if p is None else 1.0 + 3.0 * _safe_prob(p)
@@ -376,19 +334,23 @@ def draw_asc_flow_matplotlib_wide(
         is_SA = (u in pos_states) and (v in pos_actions)
         ls    = "--" if is_SA else "-"
 
-        # (NEW) ensure we have a label for A→target
-        label = None if is_SA else (data.get("label") if data.get("label") is not None
-                                    else (f"{_safe_prob(p):.3f}" if p is not None else None))
+        # ensure label exists for A→target; keep None for S→A
+        if is_SA:
+            label_val = None
+        else:
+            label_val = data.get("label")
+            if label_val is None and p is not None:
+                label_val = _safe_prob(p)  # 0.0 allowed (will show "0.000")
 
         arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
-              label=label, lw=lw, linestyle=ls)
+              label=label_val, lw=lw, linestyle=ls)
 
     # dynamic limits
     xs, ys = [], []
     def add_rect_extents(x, y):
-        xs.extend([x - 0.03, x + 0.03]); ys.extend([y - 0.045 - 0.02, y + 0.045 + 0.02])
+        xs.extend([x - RECT_W/2, x + RECT_W/2]); ys.extend([y - RECT_H/2 - 0.02, y + RECT_H/2 + 0.02])
     def add_circle_extents(x, y):
-        xs.extend([x - 0.035, x + 0.035]); ys.extend([y - 0.035 - 0.02, y + 0.035 + 0.02])
+        xs.extend([x - CIRCLE_R, x + CIRCLE_R]); ys.extend([y - CIRCLE_R - 0.02, y + CIRCLE_R + 0.02])
 
     for _, (xL, y) in pos_states.items():  add_rect_extents(xnorm(xL), y)
     for _, (xL, y) in pos_actions.items(): add_circle_extents(xnorm(xL), y)
