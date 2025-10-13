@@ -134,7 +134,7 @@ def build_flow_layers(
     return state_layers, action_layers, edges, term_clones
 
 
-# 3) Drawer (ONLY annotation logic changed; rest kept as-is)
+# 3) Drawer — curved left arrows + labels inside shapes + auto-sized shapes
 def draw_asc_flow_matplotlib_wide(
     asc,
     start_state: str,
@@ -145,18 +145,53 @@ def draw_asc_flow_matplotlib_wide(
     title: Optional[str] = None,
     hscale: float = 1.6,
     *,
-    probs_attr: str = "auto",                # kept for compatibility with your copy
-    state_text_rotation: float = 0.0,
-    action_text_rotation: float = 0.0,
-    terminal_text_rotation: float = 0.0,
-    edge_label_rotation: "float|str|None" = "auto",
+    # node text
+    node_fontsize: int = 10,
+    node_padding_px: int = 6,        # padding around text inside shapes (pixels)
+    # edge label
+    edge_label_rotation: "float|str|None" = "auto",   # "auto" | number | None
+    # dashed S→A
+    sa_linestyle = "--",
+    at_linestyle = "-",
+    # curve left-going edges
+    bend_left: bool = True,
+    bend_rad: float = 0.18,
+    bend_min_dx: float = 0.02,
 ):
-    # sizes
-    RECT_W, RECT_H = 0.06, 0.09
-    CIRCLE_R = 0.035
-    LABEL_DY = 0.02
+    """
+    Draw an ASC flow chart:
+      • labels INSIDE the shapes; shapes auto-size to fit the text;
+      • S→A dashed; A→T solid with probability labels (midpoint + slope rotation);
+      • right→left arrows are gently curved.
+    """
+    # ---------- helpers ----------
+    def _safe_prob(val: float) -> float:
+        try:
+            p = float(val)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(p): return 0.0
+        if p < 0.0: p = 0.0
+        if p > 1.0: p = 1.0
+        return p
 
-    # build skeleton
+    def _measure_text_px(ax, text: str, fontsize: int):
+        """Return (w_px, h_px) for text at fontsize, without drawing it."""
+        t = ax.text(0, 0, text, fontsize=fontsize, ha="center", va="center", visible=False)
+        fig = ax.figure
+        fig.canvas.draw()  # ensure renderer exists
+        bb = t.get_window_extent(renderer=fig.canvas.get_renderer())
+        t.remove()
+        return bb.width, bb.height
+
+    def _px_to_data(ax, dx_px: float, dy_px: float):
+        """Convert pixel deltas to data deltas at the origin."""
+        inv = ax.transData.inverted()
+        x0, y0 = inv.transform((0, 0))
+        x1, y1 = inv.transform((dx_px, dy_px))
+        return x1 - x0, y1 - y0
+
+    # ---------- build skeleton ----------
     state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
         asc,
         start_state=start_state,
@@ -180,7 +215,7 @@ def draw_asc_flow_matplotlib_wide(
     edges_AT = [(u, v, {"p": float(p), "label": f"{p:.3f}"}) for (u, v), p in acc.items()]
     edges = edges_SA + edges_AT
 
-    # layout helpers
+    # ---------- layout ----------
     def positions_by_layer(names, layer_map):
         by_layer = defaultdict(list)
         for n in names:
@@ -194,11 +229,9 @@ def draw_asc_flow_matplotlib_wide(
                 pos[n] = (L, y)
         return pos
 
-    # actions (odd) spread
     action_names = list(action_layers.keys())
     pos_actions = positions_by_layer(action_names, action_layers)
 
-    # pack real states + clones together per even layer
     clone_names = set(term_clones.keys())
     state_names = [s for s in state_layers if s not in clone_names]
 
@@ -225,92 +258,118 @@ def draw_asc_flow_matplotlib_wide(
     def xnorm(L):
         return 0.0 if Lmax == Lmin else ((L - Lmin) / (Lmax - Lmin)) * hscale
 
+    # ---------- prepare figure (we need renderer for sizing) ----------
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
     ax.axis("off")
     if title:
         ax.set_title(title)
 
-    # draw nodes (kept outside labels as in your version)
+    # ---------- compute shape sizes from text ----------
+    # measure → convert px to data → set sizes per node
+    pad_dx, pad_dy = _px_to_data(ax, node_padding_px, node_padding_px)
+
+    rect_size = {}   # node -> (w,h)
+    circle_r = {}    # action -> r
+
+    for s in state_names:
+        w_px, h_px = _measure_text_px(ax, s, node_fontsize)
+        w_d, h_d = _px_to_data(ax, w_px, h_px)
+        rect_size[s] = (w_d + 2 * pad_dx, h_d + 2 * pad_dy)
+
+    for c, meta in term_clones.items():
+        base = meta["base"]
+        w_px, h_px = _measure_text_px(ax, base, node_fontsize)
+        w_d, h_d = _px_to_data(ax, w_px, h_px)
+        rect_size[c] = (w_d + 2 * pad_dx, h_d + 2 * pad_dy)
+
+    for a in action_names:
+        w_px, h_px = _measure_text_px(ax, a, node_fontsize)
+        w_d, h_d = _px_to_data(ax, w_px, h_px)
+        # circle radius so W×H fits inside the disk
+        r = 0.5 * math.sqrt((w_d + 2 * pad_dx) ** 2 + (h_d + 2 * pad_dy) ** 2)
+        circle_r[a] = r
+
+    # ---------- draw nodes (labels inside) ----------
+    xs, ys = [], []   # collect extents for autoscale
+
+    def add_rect(x, y, w, h, label):
+        ax.add_patch(Rectangle((x - w/2, y - h/2), w, h, ec="black", fc="white"))
+        ax.text(x, y, label, fontsize=node_fontsize, ha="center", va="center")
+        xs.extend([x - w/2, x + w/2]); ys.extend([y - h/2, y + h/2])
+
+    def add_circle(x, y, r, label):
+        ax.add_patch(Circle((x, y), r, ec="black", fc="lightgrey"))
+        ax.text(x, y, label, fontsize=node_fontsize, ha="center", va="center")
+        xs.extend([x - r, x + r]); ys.extend([y - r, y + r])
+
     for s in state_names:
         xL, y = pos_states[s]; x = xnorm(xL)
-        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
-        ax.text(x, y + RECT_H/2 + LABEL_DY, s, fontsize=9, ha="center", va="bottom",
-                rotation=state_text_rotation, rotation_mode="anchor")
+        w, h = rect_size[s]
+        add_rect(x, y, w, h, s)
 
     for a in action_names:
         xL, y = pos_actions[a]; x = xnorm(xL)
-        ax.add_patch(Circle((x, y), CIRCLE_R, ec="black", fc="lightgrey"))
-        ax.text(x, y + CIRCLE_R + LABEL_DY, a, fontsize=9, ha="center", va="bottom",
-                rotation=action_text_rotation, rotation_mode="anchor")
+        add_circle(x, y, circle_r[a], a)
 
     for clone, (xL, y) in pos_clones.items():
         x = xnorm(xL)
         base = term_clones[clone]["base"]
-        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
-        ax.text(x, y + RECT_H/2 + LABEL_DY, base, fontsize=9, ha="center", va="bottom",
-                rotation=terminal_text_rotation, rotation_mode="anchor")
+        w, h = rect_size[clone]
+        add_rect(x, y, w, h, base)
 
-    # ---------- ONLY the arrow/label logic below is new/corrected ----------
-    def _safe_prob(val: float) -> float:
-        """None/NaN/±inf → 0; clamp to [0,1]."""
-        try:
-            p = float(val)
-        except (TypeError, ValueError):
-            return 0.0
-        if not math.isfinite(p):
-            return 0.0
-        if p < 0.0: p = 0.0
-        if p > 1.0: p = 1.0
-        return p
+    # convenience lookups for offsets
+    def x_half(node):
+        if node in rect_size:
+            return rect_size[node][0] / 2.0
+        if node in circle_r:
+            return circle_r[node]
+        # default small offset if something missing
+        return _px_to_data(ax, 6, 0)[0]
 
+    # ---------- arrows (curved right→left, midpoint labels) ----------
     def arrow(xy0, xy1, *, label=None, lw=1.0, linestyle="-"):
-        """
-        Draw arrow and label it like the WORKING code:
-          • label at the **midpoint of the straight chord**;
-          • angle from chord slope (atan2), flipped to keep text upright;
-          • label shown even for p==0.0 (we test label is not None).
-        """
         x0, y0 = xy0; x1, y1 = xy1
+        dx, dy = (x1 - x0), (y1 - y0)
+
+        # curve only when pointing left by a noticeable amount
+        if bend_left and (dx < -bend_min_dx):
+            sgn = 1 if dy >= 0 else -1
+            conn = f"arc3,rad={sgn * bend_rad}"
+        else:
+            conn = "arc3,rad=0"
+
         patch = FancyArrowPatch(
             xy0, xy1,
             arrowstyle="-|>",
             lw=lw,
             color="black",
-            mutation_scale=20,
             linestyle=linestyle,
             capstyle="butt",
             joinstyle="miter",
+            mutation_scale=20,
+            connectionstyle=conn,
         )
         ax.add_patch(patch)
 
-        # show labels even when value is 0.0
+        # label like your working code: midpoint of chord + slope rotation
         if label is not None:
-            # synthesize string if label is numeric
             try:
                 label_str = f"{float(label):.3f}"
             except Exception:
                 label_str = str(label)
-
-            # midpoint + angle like the original working code
             xm = (x0 + x1) / 2.0
             ym = (y0 + y1) / 2.0
-
             if isinstance(edge_label_rotation, (int, float)):
                 rot = float(edge_label_rotation)
             elif edge_label_rotation == "auto":
                 rot = math.degrees(math.atan2(y1 - y0, x1 - x0))
-                if rot < -90 or rot > 90:
-                    rot += 180
+                if rot < -90 or rot > 90: rot += 180
             else:
                 rot = 0.0
-
-            ax.annotate(
-                label_str, (xm, ym),
-                xytext=(0, 4), textcoords="offset points",
-                fontsize=8, ha="center", va="bottom",
-                rotation=rot, rotation_mode="anchor",
-                clip_on=False, zorder=5
-            )
+            ax.annotate(label_str, (xm, ym), xytext=(0, 4), textcoords="offset points",
+                        fontsize=8, ha="center", va="bottom",
+                        rotation=rot, rotation_mode="anchor",
+                        clip_on=False, zorder=5)
 
     def get_xy(node):
         if node in pos_states:
@@ -321,45 +380,37 @@ def draw_asc_flow_matplotlib_wide(
             xL, y = pos_clones[node]
         return (xnorm(xL), y)
 
-    START_OFFSET, END_OFFSET = 0.05, 0.05
-
-    # draw deduped edges
+    # draw edges with direction-aware clearance from shapes
     for u, v, data in edges:
         x0, y0 = get_xy(u)
         x1, y1 = get_xy(v)
+
+        # compute start/end x so the arrow starts/ends at the shape boundary
+        off_u = x_half(u) + _px_to_data(ax, 2, 0)[0]
+        off_v = x_half(v) + _px_to_data(ax, 2, 0)[0]
+        if x1 >= x0:
+            sx = x0 + off_u; ex = x1 - off_v
+        else:
+            sx = x0 - off_u; ex = x1 + off_v
 
         p = data.get("p")
         lw = 1.0 if p is None else 1.0 + 3.0 * _safe_prob(p)
 
         is_SA = (u in pos_states) and (v in pos_actions)
-        ls    = "--" if is_SA else "-"
+        ls    = sa_linestyle if is_SA else at_linestyle
 
-        # ensure label exists for A→target; keep None for S→A
-        if is_SA:
-            label_val = None
-        else:
-            label_val = data.get("label")
-            if label_val is None and p is not None:
-                label_val = _safe_prob(p)  # 0.0 allowed (will show "0.000")
+        label_val = None if is_SA else (data.get("label") if data.get("label") is not None
+                                        else (f"{_safe_prob(p):.3f}" if p is not None else None))
 
-        arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
-              label=label_val, lw=lw, linestyle=ls)
+        arrow((sx, y0), (ex, y1), label=label_val, lw=lw, linestyle=ls)
 
-    # dynamic limits
-    xs, ys = [], []
-    def add_rect_extents(x, y):
-        xs.extend([x - RECT_W/2, x + RECT_W/2]); ys.extend([y - RECT_H/2 - 0.02, y + RECT_H/2 + 0.02])
-    def add_circle_extents(x, y):
-        xs.extend([x - CIRCLE_R, x + CIRCLE_R]); ys.extend([y - CIRCLE_R - 0.02, y + CIRCLE_R + 0.02])
+        # include arrow ends in extents so autoscale has room
+        xs.extend([sx, ex]); ys.extend([y0, y1])
 
-    for _, (xL, y) in pos_states.items():  add_rect_extents(xnorm(xL), y)
-    for _, (xL, y) in pos_actions.items(): add_circle_extents(xnorm(xL), y)
-    for _, (xL, y) in pos_clones.items():  add_rect_extents(xnorm(xL), y)
-
+    # ---------- autoscale ----------
     if xs and ys:
-        pad_x, pad_y = 0.06, 0.10
-        ax.set_xlim(min(xs) - pad_x, max(xs) + pad_x)
-        ax.set_ylim(min(ys) - pad_y, max(ys) + pad_y)
+        ax.set_xlim(min(xs) - 0.06, max(xs) + 0.06)
+        ax.set_ylim(min(ys) - 0.10, max(ys) + 0.10)
     ax.margins(x=0.02, y=0.04)
 
     return fig, ax
