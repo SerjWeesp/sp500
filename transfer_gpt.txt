@@ -9,8 +9,8 @@ def draw_asc_flow_matplotlib(
     hscale: float = 1.6,
     *,
     # text
-    state_text_rotation: float = 0.0,
-    action_text_rotation: float = 0.0,
+    state_text_rotation: float = 0.0,        # kept for compatibility, but labels go inside
+    action_text_rotation: float = 0.0,       # (rotation rarely used inside shapes)
     terminal_text_rotation: float = 0.0,
     edge_label_rotation: "float|str|None" = "auto",   # "auto" | number | None
     # arrow visuals
@@ -19,102 +19,30 @@ def draw_asc_flow_matplotlib(
     bend_left: bool = True,                   # gently bend left-pointing arrows
     bend_rad: float = 0.18,                   # curvature (~0.10–0.30)
     bend_min_dx: float = 0.02,                # ignore tiny left drifts
-    # label placement
-    label_pos: float = 0.60,                  # place labels at 60% along arrow
-    label_offset_pts: int = 4,                # pixel offset away from the path
+    # label placement on edges
+    label_pos: float = 0.60,                  # 60% along arrow length
+    label_offset_pts: int = 4,                # small offset from the path
 ):
     """
-    Draw an ASC flow chart (no swaps/jitter). Requires build_flow_layers(...).
-
-    - S→A edges: dashed (configurable)
-    - Left-pointing arrows: slight arc
-    - Edge labels at a fraction along the (possibly curved) arrow
-    - Deduplicates A→target edges by (action, target), keeping max p
-    - Packs real states + clones together per even layer to avoid overlap
+    Draw an ASC flow chart with:
+      • labels INSIDE rectangles/circles, auto-shrunk to fit (no overflow);
+      • probability labels on edges (restored even if 'label' missing);
+      • dashed S→A, gentle bend for left-going arrows; labels at 60% along arrow.
     """
     import math
     import numpy as np
     from collections import defaultdict
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyArrowPatch, Rectangle, Circle
+    import textwrap
 
-    # ---- sizes ----
+    # ---- sizes (data units) ----
     RECT_W, RECT_H = 0.06, 0.09
     CIRCLE_R = 0.035
+    # outside labels above shapes are not used now, but keep a small top margin
     LABEL_DY = 0.02
 
-    # ---- build skeleton (probabilities from your builder) ----
-    state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
-        asc,
-        start_state=start_state,
-        prob_threshold=prob_threshold,
-        terminal_clone_scope=terminal_clone_scope,
-        which_terminals=which_terminals,
-    )
-
-    # ---- dedupe A→target (keep S→A as-is) ----
-    edges_SA = []
-    acc = {}  # (A, target) -> max p
-    for u, v, data in edges_raw:
-        if (u in state_layers) and (v in action_layers):    # State -> Action
-            edges_SA.append((u, v, {"p": None, "label": None}))
-        else:                                               # Action -> State/Clone
-            p = data.get("p", 0.0)
-            try:
-                p = float(p)
-            except (TypeError, ValueError):
-                p = 0.0
-            acc[(u, v)] = max(acc.get((u, v), p), p)
-
-    edges_AT = [(u, v, {"p": float(p), "label": f"{float(p):.3f}"}) for (u, v), p in acc.items()]
-    edges = edges_SA + edges_AT
-
-    # ---- layout helpers ----
-    def positions_by_layer(names, layer_map):
-        by_layer = defaultdict(list)
-        for n in names:
-            by_layer[layer_map[n]].append(n)
-        pos = {}
-        for L, nodes in by_layer.items():
-            nodes = sorted(nodes)
-            m = len(nodes)
-            ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
-            for n, y in zip(nodes, ys):
-                pos[n] = (L, y)
-        return pos
-
-    # actions (odd columns) spread
-    action_names = list(action_layers.keys())
-    pos_actions = positions_by_layer(action_names, action_layers)
-
-    # pack real states + clones together per even layer (so no overlap / bottom-bunching)
-    clone_names = set(term_clones.keys())
-    state_names = [s for s in state_layers if s not in clone_names]
-
-    layer_to_items = defaultdict(list)  # L -> [("state", name) or ("clone", name)]
-    for s in state_names:
-        layer_to_items[state_layers[s]].append(("state", s))
-    for c in clone_names:
-        layer_to_items[state_layers[c]].append(("clone", c))
-
-    pos_states, pos_clones = {}, {}
-    for L, items in layer_to_items.items():
-        items = sorted(items, key=lambda t: (t[0] != "state", t[1]))  # states first
-        m = len(items)
-        ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
-        for (kind, name), y in zip(items, ys):
-            if kind == "state":
-                pos_states[name] = (L, y)
-            else:
-                pos_clones[name] = (L, y)
-
-    # ---- x normalization ----
-    all_layers = list(state_layers.values()) + list(action_layers.values())
-    Lmin, Lmax = min(all_layers), max(all_layers)
-    def xnorm(L):
-        return 0.0 if Lmax == Lmin else ((L - Lmin) / (Lmax - Lmin)) * hscale
-
-    # ---- helpers for drawing ----
+    # ---------------- helpers ----------------
     def _safe_prob(val: float) -> float:
         """None/NaN/±inf → 0; clamp to [0,1]."""
         try:
@@ -151,35 +79,178 @@ def draw_asc_flow_matplotlib(
             dx = V[i + 1, 0] - V[i, 0]
             dy = V[i + 1, 1] - V[i, 1]
         ang = math.degrees(math.atan2(dy, dx))
-        if ang < -90 or ang > 90:
-            ang += 180
+        if ang < -90 or ang > 90: ang += 180
         return (x, y), ang
+
+    def _fit_text_inside(ax, x, y, w, h, text, *, is_circle=False,
+                         max_fs=10, min_fs=6, pad_pts=4):
+        """
+        Place text centered at (x,y), shrinking font to fit inside
+        a rectangle (w×h) or an inscribed box within a circle of radius CIRCLE_R.
+        Returns the Text artist.
+        """
+        fig = ax.figure
+        # convert the available box from data → display (pixels)
+        if is_circle:
+            # inscribed square inside the circle
+            w_data = h_data = 2 * CIRCLE_R / math.sqrt(2)
+        else:
+            w_data, h_data = w, h
+        (x0_disp, y0_disp) = ax.transData.transform((x - w_data/2, y - h_data/2))
+        (x1_disp, y1_disp) = ax.transData.transform((x + w_data/2, y + h_data/2))
+        box_w = abs(x1_disp - x0_disp) - 2 * pad_pts
+        box_h = abs(y1_disp - y0_disp) - 2 * pad_pts
+
+        # create a text object and iteratively shrink to fit (with simple word-wrapping)
+        t = ax.text(x, y, text, ha="center", va="center", fontsize=max_fs,
+                    wrap=True)
+        fig.canvas.draw()  # ensure a renderer exists
+        ren = fig.canvas.get_renderer()
+
+        def measure(txt):
+            bb = txt.get_window_extent(renderer=ren)
+            return bb.width, bb.height
+
+        # greedy wrap by words if too wide; then shrink font until fits
+        words = text.split()
+        best_lines = [text]
+        fs = max_fs
+
+        while fs >= min_fs:
+            t.set_fontsize(fs)
+            # try to wrap to lines that fit width
+            lines, cur = [], ""
+            for w_ in words:
+                candidate = (cur + " " + w_).strip()
+                t.set_text(candidate if not lines else "\n".join(lines+[candidate]))
+                w_pix, _ = measure(t)
+                if w_pix <= box_w:
+                    cur = candidate
+                else:
+                    if cur:
+                        lines.append(cur)
+                        cur = w_
+                    else:
+                        # single word too long; will rely on fontsize reduction
+                        lines.append(w_)
+                        cur = ""
+            if cur:
+                lines.append(cur)
+
+            t.set_text("\n".join(lines))
+            w_pix, h_pix = measure(t)
+            if w_pix <= box_w and h_pix <= box_h:
+                best_lines = lines
+                break
+            fs -= 1
+
+        t.set_fontsize(fs)
+        t.set_text("\n".join(best_lines))
+        return t
+
+    # ---- build skeleton ----
+    state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
+        asc,
+        start_state=start_state,
+        prob_threshold=prob_threshold,
+        terminal_clone_scope=terminal_clone_scope,
+        which_terminals=which_terminals,
+    )
+
+    # ---- dedupe A→target (keep S→A as-is) & restore labels if missing ----
+    edges_SA = []
+    acc = {}  # (A, target) -> max p
+    for u, v, data in edges_raw:
+        if (u in state_layers) and (v in action_layers):    # State -> Action
+            edges_SA.append((u, v, {"p": None, "label": None}))
+        else:
+            p = _safe_prob(data.get("p"))
+            acc[(u, v)] = max(acc.get((u, v), p), p)
+
+    edges_AT = [(u, v, {"p": float(p), "label": f"{float(p):.3f}"}) for (u, v), p in acc.items()]
+    edges = edges_SA + edges_AT
+
+    # ---- layout ----
+    def positions_by_layer(names, layer_map):
+        by_layer = defaultdict(list)
+        for n in names:
+            by_layer[layer_map[n]].append(n)
+        pos = {}
+        for L, nodes in by_layer.items():
+            nodes = sorted(nodes)
+            m = len(nodes)
+            ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
+            for n, y in zip(nodes, ys):
+                pos[n] = (L, y)
+        return pos
+
+    action_names = list(action_layers.keys())
+    pos_actions = positions_by_layer(action_names, action_layers)
+
+    clone_names = set(term_clones.keys())
+    state_names = [s for s in state_layers if s not in clone_names]
+    layer_to_items = defaultdict(list)
+    for s in state_names: layer_to_items[state_layers[s]].append(("state", s))
+    for c in clone_names: layer_to_items[state_layers[c]].append(("clone", c))
+    pos_states, pos_clones = {}, {}
+    for L, items in layer_to_items.items():
+        items = sorted(items, key=lambda t: (t[0] != "state", t[1]))
+        m = len(items)
+        ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
+        for (kind, name), y in zip(items, ys):
+            (pos_states if kind == "state" else pos_clones)[name] = (L, y)
+
+    all_layers = list(state_layers.values()) + list(action_layers.values())
+    Lmin, Lmax = min(all_layers), max(all_layers)
+    def xnorm(L):
+        return 0.0 if Lmax == Lmin else ((L - Lmin) / (Lmax - Lmin)) * hscale
+
+    # ---- draw ----
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    ax.axis("off")
+    if title: ax.set_title(title)
+
+    # states (rectangle with fitted text inside)
+    for s in state_names:
+        xL, y = pos_states[s]; x = xnorm(xL)
+        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
+        _fit_text_inside(ax, x, y, RECT_W, RECT_H, s, is_circle=False)
+
+    # actions (circle with fitted text inside)
+    for a in action_names:
+        xL, y = pos_actions[a]; x = xnorm(xL)
+        ax.add_patch(Circle((x, y), CIRCLE_R, ec="black", fc="lightgrey"))
+        _fit_text_inside(ax, x, y, 2*CIRCLE_R, 2*CIRCLE_R, a, is_circle=True)
+
+    # clones (rectangle with base label inside)
+    for clone, (xL, y) in pos_clones.items():
+        x = xnorm(xL)
+        base = term_clones[clone]["base"]
+        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
+        _fit_text_inside(ax, x, y, RECT_W, RECT_H, base, is_circle=False)
+
+    # edge helpers
+    def get_xy(node):
+        if node in pos_states:  xL, y = pos_states[node]
+        elif node in pos_actions: xL, y = pos_actions[node]
+        else:                   xL, y = pos_clones[node]
+        return (xnorm(xL), y)
 
     def arrow(xy0, xy1, *, label=None, lw=1.0, linestyle="-"):
         x0, y0 = xy0; x1, y1 = xy1
         dx, dy = (x1 - x0), (y1 - y0)
-        # bend only left-pointing arrows (beyond a small threshold)
         if bend_left and (dx < -bend_min_dx):
             sgn = 1 if dy >= 0 else -1
             conn = f"arc3,rad={sgn * bend_rad}"
         else:
             conn = "arc3,rad=0"
-
         patch = FancyArrowPatch(
-            xy0, xy1,
-            arrowstyle="-|>",
-            lw=lw,
-            color="black",
-            linestyle=linestyle,
-            capstyle="butt",        # avoids big rounded blobs
-            joinstyle="miter",
-            mutation_scale=20,
-            connectionstyle=conn,
+            xy0, xy1, arrowstyle="-|>", lw=lw, color="black",
+            linestyle=linestyle, capstyle="butt", joinstyle="miter",
+            mutation_scale=20, connectionstyle=conn,
         )
         ax.add_patch(patch)
-
         if label:
-            # label position & rotation
             (xm, ym), auto_ang = _point_and_angle_on_path(patch, label_pos)
             if isinstance(edge_label_rotation, (int, float)):
                 rot = float(edge_label_rotation)
@@ -187,54 +258,28 @@ def draw_asc_flow_matplotlib(
                 rot = auto_ang
             else:
                 rot = 0.0
-            ax.annotate(
-                label, (xm, ym),
-                xytext=(0, label_offset_pts), textcoords="offset points",
-                fontsize=8, ha="center", va="bottom",
-                rotation=rot, rotation_mode="anchor", clip_on=False
-            )
+            ax.annotate(label, (xm, ym), xytext=(0, label_offset_pts),
+                        textcoords="offset points", fontsize=8,
+                        ha="center", va="bottom",
+                        rotation=rot, rotation_mode="anchor",
+                        clip_on=False)
 
-    def get_xy(node):
-        if node in pos_states:
-            xL, y = pos_states[node]
-        elif node in pos_actions:
-            xL, y = pos_actions[node]
-        else:
-            xL, y = pos_clones[node]
-        return (xnorm(xL), y)
+    START_OFFSET, END_OFFSET = 0.05, 0.05
 
-    START_OFFSET = 0.05
-    END_OFFSET   = 0.05
+    # draw edges (ensure labels exist for probabilities)
+    for u, v, data in edges:
+        x0, y0 = get_xy(u); x1, y1 = get_xy(v)
+        is_SA = (u in pos_states) and (v in pos_actions)
+        ls    = sa_linestyle if is_SA else at_linestyle
+        p_raw = data.get("p")
+        lw    = 1.0 if p_raw is None else 1.0 + 3.0 * _safe_prob(p_raw)
+        label = data.get("label")
+        if label is None and p_raw is not None:
+            label = f"{_safe_prob(p_raw):.3f}"       # <-- restore missing labels
+        arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
+              label=label, lw=lw, linestyle=ls)
 
-    # ---- draw ----
-    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-    ax.axis("off")
-    if title:
-        ax.set_title(title)
-
-    # states
-    for s in state_names:
-        xL, y = pos_states[s]; x = xnorm(xL)
-        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
-        ax.text(x, y + RECT_H/2 + LABEL_DY, s, fontsize=9, ha="center", va="bottom",
-                rotation=state_text_rotation, rotation_mode="anchor")
-
-    # actions
-    for a in action_names:
-        xL, y = pos_actions[a]; x = xnorm(xL)
-        ax.add_patch(Circle((x, y), CIRCLE_R, ec="black", fc="lightgrey"))
-        ax.text(x, y + CIRCLE_R + LABEL_DY, a, fontsize=9, ha="center", va="bottom",
-                rotation=action_text_rotation, rotation_mode="anchor")
-
-    # clones (labeled with base name)
-    for clone, (xL, y) in pos_clones.items():
-        x = xnorm(xL)
-        base = term_clones[clone]["base"]
-        ax.add_patch(Rectangle((x - RECT_W/2, y - RECT_H/2), RECT_W, RECT_H, ec="black", fc="white"))
-        ax.text(x, y + RECT_H/2 + LABEL_DY, base, fontsize=9, ha="center", va="bottom",
-                rotation=terminal_text_rotation, rotation_mode="anchor")
-
-    # collect extents for autoscale
+    # autoscale limits
     xs, ys = [], []
     def add_rect_extents(x, y):
         xs.extend([x - RECT_W/2, x + RECT_W/2])
@@ -242,26 +287,9 @@ def draw_asc_flow_matplotlib(
     def add_circle_extents(x, y):
         xs.extend([x - CIRCLE_R, x + CIRCLE_R])
         ys.extend([y - CIRCLE_R - 0.02, y + CIRCLE_R + LABEL_DY + 0.02])
-
     for _, (xL, y) in pos_states.items():  add_rect_extents(xnorm(xL), y)
     for _, (xL, y) in pos_actions.items(): add_circle_extents(xnorm(xL), y)
     for _, (xL, y) in pos_clones.items():  add_rect_extents(xnorm(xL), y)
-
-    # edges
-    for u, v, data in edges:
-        x0, y0 = get_xy(u)
-        x1, y1 = get_xy(v)
-
-        is_SA = (u in pos_states) and (v in pos_actions)
-        ls    = sa_linestyle if is_SA else at_linestyle
-
-        p_raw = data.get("p")
-        lw = 1.0 if p_raw is None else 1.0 + 3.0 * _safe_prob(p_raw)
-
-        arrow((x0 + START_OFFSET, y0), (x1 - END_OFFSET, y1),
-              label=data.get("label"), lw=lw, linestyle=ls)
-
-    # dynamic bounds to avoid clipping
     if xs and ys:
         pad_x, pad_y = 0.06, 0.10
         ax.set_xlim(min(xs) - pad_x, max(xs) + pad_x)
