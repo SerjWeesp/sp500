@@ -17,6 +17,7 @@ def draw_asc_flow_matplotlib_wide(
     min_circle_r: float = 0.035,
     # edge label
     edge_label_rotation: float | str | None = "auto",   # "auto" | number | None
+    edge_label_pos: float = 0.60,       # <--- NEW: fraction along arrow (0..1)
     # dashed S→A
     sa_linestyle = "--",
     at_linestyle = "-",
@@ -170,8 +171,11 @@ def draw_asc_flow_matplotlib_wide(
         if node in circle_r:   return circle_r[node]
         return _px_to_data(6, 0)[0]
 
-    # ---------- arrows (curved RTL, midpoint probability labels) ----------
+    # ---------- arrows (curved RTL, **label at edge_label_pos**) ----------
     def arrow(xy0, xy1, *, label=None, lw=1.0, linestyle="-"):
+        # clamp label position
+        f = max(0.0, min(1.0, edge_label_pos))
+
         x0, y0 = xy0; x1, y1 = xy1
         dx, dy = (x1 - x0), (y1 - y0)
         if bend_left and (dx < -bend_min_dx):
@@ -179,6 +183,7 @@ def draw_asc_flow_matplotlib_wide(
             conn = f"arc3,rad={sgn * bend_rad}"
         else:
             conn = "arc3,rad=0"
+
         patch = FancyArrowPatch(
             xy0, xy1, arrowstyle="-|>", lw=lw, color="black",
             linestyle=linestyle, mutation_scale=20,
@@ -186,13 +191,17 @@ def draw_asc_flow_matplotlib_wide(
             connectionstyle=conn, zorder=4
         )
         ax.add_patch(patch)
+
         if label is not None:
             try:
                 label_str = f"{float(label):.3f}"
             except Exception:
                 label_str = str(label)
-            xm = (x0 + x1) / 2.0
-            ym = (y0 + y1) / 2.0
+
+            # position at f of the chord length
+            xm = x0 + f * (x1 - x0)
+            ym = y0 + f * (y1 - y0)
+
             if isinstance(edge_label_rotation, (int, float)):
                 rot = float(edge_label_rotation)
             elif edge_label_rotation == "auto":
@@ -200,13 +209,14 @@ def draw_asc_flow_matplotlib_wide(
                 if rot < -90 or rot > 90: rot += 180
             else:
                 rot = 0.0
+
             ax.annotate(label_str, (xm, ym), xytext=(0, 4), textcoords="offset points",
                         fontsize=8, ha="center", va="bottom",
                         rotation=rot, rotation_mode="anchor",
                         clip_on=False, zorder=5)
 
     def get_xy(node):
-        if node in pos_states:  xL, y = pos_states[node]
+        if node in pos_states:   xL, y = pos_states[node]
         elif node in pos_actions: xL, y = pos_actions[node]
         else:                    xL, y = pos_clones[node]
         return (xnorm(xL), y)
