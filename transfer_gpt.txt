@@ -1,341 +1,55 @@
-def draw_asc_flow_matplotlib_wide(
-    asc,
-    start_state: str,
-    prob_threshold: float = 0.0,
-    terminal_clone_scope: str = "none",      # "none" | "action" | "layer"
-    which_terminals=None,
-    figsize=(12, 7),
-    title: str | None = None,
-    hscale: float = 1.6,
-    *,
-    # node text
-    node_fontsize: int = 10,
-    node_padding_px: int = 6,        # padding around text inside shapes (pixels)
-    # minimum sizes (fallback so shapes never collapse)
-    min_rect_w: float = 0.06,
-    min_rect_h: float = 0.09,
-    min_circle_r: float = 0.035,
-    # edge labels
-    edge_label_rotation: float | str | None = "auto",   # "auto" | number | None
-    edge_label_pos: float = 0.60,                       # fraction along edge (0..1)
-    # dashed S→A
-    sa_linestyle = "--",
-    at_linestyle = "-",
-    # curve left-going edges
-    bend_left: bool = True,
-    bend_rad: float = 0.18,
-    bend_min_dx: float = 0.02,
-):
-    import math
-    import numpy as np
-    from collections import defaultdict
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import FancyArrowPatch, Rectangle, Circle
+import io
+from pathlib import Path
+import yaml
+import pandas as pd
 
-    # ---------- helpers ----------
-    def _safe_prob(val: float) -> float:
-        try:
-            p = float(val)
-        except (TypeError, ValueError):
-            return 0.0
-        if not math.isfinite(p):
-            return 0.0
-        return 0.0 if p < 0 else (1.0 if p > 1 else p)
+def variants_params_to_df(source, *, expand_ranges=True):
+    """
+    Convert your YAML (file path or YAML string) to a tidy DataFrame:
+    columns: variant, param, type, distribution, value, value_min, value_max
+    """
+    # Detect path vs YAML string safely
+    is_pathlike = isinstance(source, (str, Path)) and isinstance(source, str) and ("\n" not in source)
+    if is_pathlike and Path(str(source)).exists():
+        with open(source, "r", encoding="utf-8") as f:
+            docs = list(yaml.safe_load_all(f))
+    else:
+        docs = list(yaml.safe_load_all(io.StringIO(str(source))))
 
-    # build skeleton
-    state_layers, action_layers, edges_raw, term_clones = build_flow_layers(
-        asc,
-        start_state=start_state,
-        prob_threshold=prob_threshold,
-        terminal_clone_scope=terminal_clone_scope,
-        which_terminals=which_terminals,
-    )
-
-    # dedupe A→target; keep S→A unchanged
-    edges_SA, acc = [], {}
-    for u, v, data in edges_raw:
-        if (u in state_layers) and (v in action_layers):
-            edges_SA.append((u, v, {"p": None, "label": None}))
-        else:
-            try:
-                p = float(data.get("p", 0.0))
-            except (TypeError, ValueError):
-                p = 0.0
-            acc[(u, v)] = max(acc.get((u, v), p), p)
-    edges_AT = [(u, v, {"p": float(p), "label": f"{p:.3f}"}) for (u, v), p in acc.items()]
-    edges = edges_SA + edges_AT
-
-    # ---------- layout ----------
-    def positions_by_layer(names, layer_map):
-        by_layer = defaultdict(list)
-        for n in names:
-            by_layer[layer_map[n]].append(n)
-        pos = {}
-        for L, nodes in by_layer.items():
-            nodes = sorted(nodes)
-            m = len(nodes)
-            ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
-            for n, y in zip(nodes, ys):
-                pos[n] = (L, y)
-        return pos
-
-    action_names = list(action_layers.keys())
-    pos_actions = positions_by_layer(action_names, action_layers)
-
-    clone_names = set(term_clones.keys())
-    state_names = [s for s in state_layers if s not in clone_names]
-
-    layer_to_items = defaultdict(list)
-    for s in state_names:
-        layer_to_items[state_layers[s]].append(("state", s))
-    for c in clone_names:
-        layer_to_items[state_layers[c]].append(("clone", c))
-
-    pos_states, pos_clones = {}, {}
-    for L, items in layer_to_items.items():
-        items = sorted(items, key=lambda t: (t[0] != "state", t[1]))  # states first
-        m = len(items)
-        ys = [0.0] if m == 1 else [1 - 2 * i / (m - 1) for i in range(m)]
-        for (kind, name), y in zip(items, ys):
-            (pos_states if kind == "state" else pos_clones)[name] = (L, y)
-
-    all_layers = list(state_layers.values()) + list(action_layers.values())
-    Lmin, Lmax = min(all_layers), max(all_layers)
-
-    def xnorm(L):
-        return 0.0 if Lmax == Lmin else ((L - Lmin) / (Lmax - Lmin)) * hscale
-
-    # ---------- figure / renderer ----------
-    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-    ax.axis("off")
-    if title:
-        ax.set_title(title)
-
-    # Set stable limits before px→data conversion (so sizing is meaningful)
-    ax.set_xlim(-0.2, hscale + 0.2)
-    ax.set_ylim(-1.2, 1.2)
-    fig.canvas.draw()  # renderer ready
-
-    # text measurement & px→data
-    def _measure_text_px(text: str, fontsize: int):
-        t = ax.text(0, 0, text, fontsize=fontsize, ha="center", va="center", alpha=0.0)
-        fig.canvas.draw()
-        bb = t.get_window_extent(renderer=fig.canvas.get_renderer())
-        t.remove()
-        return bb.width, bb.height
-
-    def _px_to_data(dx_px: float, dy_px: float):
-        inv = ax.transData.inverted()
-        x0, y0 = inv.transform((0, 0))
-        x1, y1 = inv.transform((dx_px, dy_px))
-        return x1 - x0, y1 - y0
-
-    pad_dx, pad_dy = _px_to_data(node_padding_px, node_padding_px)
-
-    # compute shape sizes with minimums
-    rect_size = {}
-    for s in state_names:
-        w_px, h_px = _measure_text_px(s, node_fontsize)
-        w_d, h_d = _px_to_data(w_px, h_px)
-        w = max(w_d + 2 * pad_dx, min_rect_w)
-        h = max(h_d + 2 * pad_dy, min_rect_h)
-        rect_size[s] = (w, h)
-    for c, meta in term_clones.items():
-        base = meta["base"]
-        w_px, h_px = _measure_text_px(base, node_fontsize)
-        w_d, h_d = _px_to_data(w_px, h_px)
-        w = max(w_d + 2 * pad_dx, min_rect_w)
-        h = max(h_d + 2 * pad_dy, min_rect_h)
-        rect_size[c] = (w, h)
-
-    circle_r = {}
-    for a in action_names:
-        w_px, h_px = _measure_text_px(a, node_fontsize)
-        w_d, h_d = _px_to_data(w_px, h_px)
-        r = 0.5 * ((w_d + 2 * pad_dx) ** 2 + (h_d + 2 * pad_dy) ** 2) ** 0.5
-        circle_r[a] = max(r, min_circle_r)
-
-    # ---------- draw nodes (labels inside) ----------
-    xs, ys = [], []
-
-    def add_rect(x, y, w, h, label):
-        ax.add_patch(Rectangle((x - w / 2, y - h / 2), w, h, ec="black", fc="white", zorder=2))
-        ax.text(x, y, label, fontsize=node_fontsize, ha="center", va="center", zorder=3)
-        xs.extend([x - w / 2, x + w / 2])
-        ys.extend([y - h / 2, y + h / 2])
-
-    def add_circle(x, y, r, label):
-        ax.add_patch(Circle((x, y), r, ec="black", fc="lightgrey", zorder=2))
-        ax.text(x, y, label, fontsize=node_fontsize, ha="center", va="center", zorder=3)
-        xs.extend([x - r, x + r])
-        ys.extend([y - r, y + r])
-
-    for s in state_names:
-        xL, y = pos_states[s]
-        x = xnorm(xL)
-        w, h = rect_size[s]
-        add_rect(x, y, w, h, s)
-
-    for a in action_names:
-        xL, y = pos_actions[a]
-        x = xnorm(xL)
-        add_circle(x, y, circle_r[a], a)
-
-    for clone, (xL, y) in pos_clones.items():
-        x = xnorm(xL)
-        base = term_clones[clone]["base"]
-        w, h = rect_size[clone]
-        add_rect(x, y, w, h, base)
-
-    # half-width for offsetting arrows from node edges
-    def x_half(node):
-        if node in rect_size:
-            return rect_size[node][0] / 2.0
-        if node in circle_r:
-            return circle_r[node]
-        return _px_to_data(6, 0)[0]
-
-    # ---- path helpers for bent arrows ----
-    def _path_vertices_in_data(patch):
-        """Return Nx2 vertices of the patch path in DATA coords."""
-        path_disp = patch.get_path().transformed(patch.get_transform())
-        return ax.transData.inverted().transform(path_disp.vertices)
-
-    def _extend_limits_with_vertices(verts, add_pad_px_y=8):
-        """Extend xs/ys with curve vertices and small extra y-padding."""
-        if verts is None or len(verts) == 0:
-            return
-        xs.extend(verts[:, 0].tolist())
-        ys.extend(verts[:, 1].tolist())
-        _, pad_dy_local = _px_to_data(0, add_pad_px_y)
-        ys.append(verts[:, 1].max() + pad_dy_local)
-        ys.append(verts[:, 1].min() - pad_dy_local)
-
-    def _point_and_angle_on_path(patch, frac: float):
-        """((x,y), angle_deg) at 'frac' along the arrow path (DATA coords)."""
-        frac = max(0.0, min(1.0, float(frac)))
-        V = _path_vertices_in_data(patch)
-        if len(V) < 2:
-            return (V[-1, 0], V[-1, 1]), 0.0
-        seg = np.diff(V, axis=0)
-        seg_len = np.hypot(seg[:, 0], seg[:, 1])
-        total = float(seg_len.sum())
-        if total <= 0:
-            return (V[-1, 0], V[-1, 1]), 0.0
-        target = frac * total
-        acc = 0.0
-        for i, s in enumerate(seg_len):
-            if acc + s >= target:
-                t = 0.0 if s == 0 else (target - acc) / s
-                x = (1 - t) * V[i, 0] + t * V[i + 1, 0]
-                y = (1 - t) * V[i, 1] + t * V[i + 1, 1]
-                dx = V[i + 1, 0] - V[i, 0]
-                dy = V[i + 1, 1] - V[i, 1]
-                ang = math.degrees(math.atan2(dy, dx))
-                if ang < -90 or ang > 90:
-                    ang += 180
-                return (x, y), ang
-            acc += s
-        dx = V[-1, 0] - V[-2, 0]
-        dy = V[-1, 1] - V[-2, 1]
-        ang = math.degrees(math.atan2(dy, dx))
-        if ang < -90 or ang > 90:
-            ang += 180
-        return (V[-1, 0], V[-1, 1]), ang
-
-    # ---------- arrows (curved RTL; labels follow curve; limits include curve) ----------
-    def arrow(xy0, xy1, *, label=None, lw=1.0, linestyle="-"):
-        f = max(0.0, min(1.0, edge_label_pos))  # label position fraction
-
-        x0, y0 = xy0
-        x1, y1 = xy1
-        dx, dy = (x1 - x0), (y1 - y0)
-        is_bent = bend_left and (dx < -bend_min_dx)
-        conn = f"arc3,rad={(1 if dy >= 0 else -1) * bend_rad}" if is_bent else "arc3,rad=0"
-
-        patch = FancyArrowPatch(
-            xy0, xy1,
-            arrowstyle="-|>",
-            lw=lw,
-            color="black",
-            linestyle=linestyle,
-            mutation_scale=20,
-            capstyle="butt",
-            joinstyle="miter",
-            connectionstyle=conn,
-            zorder=4,
-        )
-        ax.add_patch(patch)
-
-        # include curved path in autoscale
-        if is_bent:
-            verts = _path_vertices_in_data(patch)
-            _extend_limits_with_vertices(verts)
-
-        if label is not None:
-            try:
-                label_str = f"{float(label):.3f}"
-            except Exception:
-                label_str = str(label)
-
-            if is_bent:
-                (xm, ym), auto_ang = _point_and_angle_on_path(patch, f)
-                rot = (float(edge_label_rotation) if isinstance(edge_label_rotation, (int, float))
-                       else (auto_ang if edge_label_rotation == "auto" else 0.0))
-            else:
-                xm = x0 + f * (x1 - x0)
-                ym = y0 + f * (y1 - y0)
-                if isinstance(edge_label_rotation, (int, float)):
-                    rot = float(edge_label_rotation)
-                elif edge_label_rotation == "auto":
-                    rot = math.degrees(math.atan2(y1 - y0, x1 - x0))
-                    if rot < -90 or rot > 90:
-                        rot += 180
+    rows = []
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        variants = doc.get("variants", [])
+        if not isinstance(variants, list):
+            continue
+        for v in variants:
+            vname = v.get("name")
+            params = v.get("parameters", []) or []
+            for p in params:
+                pname = p.get("name")
+                ptype = p.get("type")
+                dist  = p.get("distribution")
+                val   = p.get("value")
+                row = {
+                    "variant": vname,
+                    "param": pname,
+                    "type": ptype,
+                    "distribution": dist,
+                    "value": None,
+                    "value_min": None,
+                    "value_max": None,
+                }
+                # If value is a [min, max] numeric range, split it
+                if isinstance(val, list) and expand_ranges and len(val) == 2 and all(isinstance(x, (int, float)) for x in val):
+                    row["value_min"], row["value_max"] = val[0], val[1]
                 else:
-                    rot = 0.0
+                    row["value"] = val
+                rows.append(row)
 
-            ax.annotate(
-                label_str, (xm, ym),
-                xytext=(0, 4), textcoords="offset points",
-                fontsize=8, ha="center", va="bottom",
-                rotation=rot, rotation_mode="anchor",
-                clip_on=False, zorder=5,
-            )
-            xs.append(xm); ys.append(ym)
-
-    def get_xy(node):
-        if node in pos_states:
-            xL, y = pos_states[node]
-        elif node in pos_actions:
-            xL, y = pos_actions[node]
-        else:
-            xL, y = pos_clones[node]
-        return (xnorm(xL), y)
-
-    for u, v, data in edges:
-        x0, y0 = get_xy(u)
-        x1, y1 = get_xy(v)
-        off_u = x_half(u) + _px_to_data(2, 0)[0]
-        off_v = x_half(v) + _px_to_data(2, 0)[0]
-        if x1 >= x0:
-            sx, ex = x0 + off_u, x1 - off_v
-        else:
-            sx, ex = x0 - off_u, x1 + off_v
-
-        p = data.get("p")
-        lw = 1.0 if p is None else 1.0 + 3.0 * _safe_prob(p)
-        is_SA = (u in pos_states) and (v in pos_actions)
-        ls = sa_linestyle if is_SA else at_linestyle
-        label_val = None if is_SA else (data.get("label") if data.get("label") is not None
-                                        else (f"{_safe_prob(p):.3f}" if p is not None else None))
-
-        arrow((sx, y0), (ex, y1), label=label_val, lw=lw, linestyle=ls)
-        xs.extend([sx, ex]); ys.extend([y0, y1])
-
-    # ---------- autoscale ----------
-    if xs and ys:
-        ax.set_xlim(min(xs) - 0.06, max(xs) + 0.06)
-        ax.set_ylim(min(ys) - 0.10, max(ys) + 0.10)
-    ax.margins(x=0.02, y=0.04)
-
-    return fig, ax
+    df = pd.DataFrame(rows)
+    # Ensure numeric where appropriate
+    for c in ["value_min", "value_max"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
