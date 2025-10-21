@@ -1,14 +1,19 @@
+# pip install pyyaml pandas
+
 import io
 from pathlib import Path
 import yaml
 import pandas as pd
 
+# ---------- 1) YAML → tidy rows (variant, param, type, distribution, value...) ----------
 def variants_params_to_df(source, *, expand_ranges=True):
     """
-    Convert your YAML (file path or YAML string) to a tidy DataFrame:
-    columns: variant, param, type, distribution, value, value_min, value_max
+    Convert your YAML (file path or YAML string) to a tidy DataFrame with columns:
+    ['variant','param','type','distribution','value','value_min','value_max'].
+    If a parameter's 'value' is a numeric 2-list like [0.8, 0.92], it is split into
+    value_min/value_max (when expand_ranges=True). Otherwise it stays in 'value'.
     """
-    # Detect path vs YAML string safely
+    # Detect path vs inline YAML string
     is_pathlike = isinstance(source, (str, Path)) and isinstance(source, str) and ("\n" not in source)
     if is_pathlike and Path(str(source)).exists():
         with open(source, "r", encoding="utf-8") as f:
@@ -40,7 +45,6 @@ def variants_params_to_df(source, *, expand_ranges=True):
                     "value_min": None,
                     "value_max": None,
                 }
-                # If value is a [min, max] numeric range, split it
                 if isinstance(val, list) and expand_ranges and len(val) == 2 and all(isinstance(x, (int, float)) for x in val):
                     row["value_min"], row["value_max"] = val[0], val[1]
                 else:
@@ -48,8 +52,71 @@ def variants_params_to_df(source, *, expand_ranges=True):
                 rows.append(row)
 
     df = pd.DataFrame(rows)
-    # Ensure numeric where appropriate
-    for c in ["value_min", "value_max"]:
+    for c in ("value_min", "value_max"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+# ---------- 2) Walk scenario folders and collect files ----------
+def collect_yaml_files(root_dir, *, recursive=True):
+    root = Path(root_dir)
+    patterns = ["*.yaml", "*.yml"]
+    files = []
+    for pat in patterns:
+        files.extend(root.rglob(pat) if recursive else root.glob(pat))
+    # sort for reproducibility
+    return sorted(files)
+
+
+# ---------- 3) Convert all YAMLs; attach scenario (folder) + file info ----------
+def convert_scenarios_to_df(root_dir, *, scenario_level=1, expand_ranges=True):
+    """
+    root_dir: top folder containing scenario subfolders.
+    scenario_level:
+        1 → use immediate parent folder as scenario name
+        2+ → use 'level' folders above file joined by '/' (e.g., 'A/B')
+    expand_ranges: forward to variants_params_to_df
+    Returns one combined DataFrame.
+    """
+    rows = []
+    files = collect_yaml_files(root_dir)
+    for path in files:
+        try:
+            df = variants_params_to_df(path, expand_ranges=expand_ranges)
+            if df.empty:
+                continue
+            # scenario name from parent folders
+            parts = path.parts
+            # scenario is the folder(s) above the file; clamp to root gracefully
+            scenario_parts = parts[max(0, len(parts) - (scenario_level + 1)) : len(parts) - 1]
+            scenario = "/".join(scenario_parts) if scenario_parts else path.parent.name
+
+            df.insert(0, "scenario", scenario)         # first column
+            df.insert(1, "file_name", path.name)
+            df.insert(2, "rel_path", str(path.relative_to(root_dir)))
+            rows.append(df)
+        except Exception as e:
+            # Log and continue (don't break the whole run on one bad file)
+            print(f"[WARN] Failed to parse {path}: {e}")
+            continue
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "scenario","file_name","rel_path",
+            "variant","param","type","distribution","value","value_min","value_max"
+        ])
+
+    big = pd.concat(rows, ignore_index=True)
+    # Arrange columns: provenance first, then core fields
+    cols = ["scenario","file_name","rel_path","variant","param","type","distribution","value","value_min","value_max"]
+    return big.reindex(columns=cols)
+
+
+# ---------- 4) Run it ----------
+# Example:
+# root = r"G:\GRS_IMR_Model_Docs\Model Reviews\Credit\Retail_FO\Cyber Risk Models\GMIS-066360, Cyber Risk Quantification Tool\IMR\yaml"
+# df_all = convert_scenarios_to_df(root, scenario_level=1, expand_ranges=True)
+# print(df_all.head())
+# df_all.to_csv(r"G:\... \all_variants_params.csv", index=False)
+# df_all.to_parquet(r"G:\... \all_variants_params.parquet", index=False)
