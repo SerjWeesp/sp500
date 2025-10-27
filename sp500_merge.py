@@ -9,7 +9,10 @@ import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 import ta
+import ctypes
+from datetime import datetime
 
+run_stamp = datetime.now().strftime("%d%m%Y")  # {timestamp}
 prices_path = "sp500_prices_02092025.csv"
 financials_path = "sp500_financials_01092025.csv"
 financials_0_path = "sp500_financials_13082025.csv"
@@ -55,8 +58,7 @@ def restructure_df(df):
 
 def compute_quarter_metrics(df, dates):
     df = df.copy()
-    df["Date"] = pd.to_datetime(
-        df["Date"].astype(str).str[:10], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"].astype(str).str[:10], errors="coerce")
     df.sort_values(["Company", "Date"], inplace=True, kind="mergesort")
 
     results = []
@@ -66,91 +68,120 @@ def compute_quarter_metrics(df, dates):
         if sub.empty:
             continue
 
-        dates_arr = sub["Date"].astype("datetime64[ns]").to_numpy()
-        close = sub["Close"].to_numpy()
-        vol = sub["Volume"].to_numpy()
-        div = sub["Dividends"].to_numpy()
+        dates_arr = sub["Date"].to_numpy(dtype="datetime64[ns]")
 
-        macd = ta.trend.MACD(
-            close=sub["Close"], window_slow=60, window_fast=30, window_sign=30)
-        macd_line = macd.macd().to_numpy()
+        # Use float64 accumulators to reduce cancellation
+        close = sub["Close"].to_numpy(dtype=np.float64)
+        vol   = sub["Volume"].to_numpy(dtype=np.float64)
+        div   = sub["Dividends"].to_numpy(dtype=np.float64)
+
+        macd = ta.trend.MACD(close=sub["Close"], window_slow=60, window_fast=30, window_sign=30)
+        macd_line   = macd.macd().to_numpy()
         macd_signal = macd.macd_signal().to_numpy()
-        macd_hist = macd.macd_diff().to_numpy()
-        rsi = ta.momentum.RSIIndicator(
-            close=sub["Close"], window=60).rsi().to_numpy()
+        macd_hist   = macd.macd_diff().to_numpy()
+        rsi = ta.momentum.RSIIndicator(close=sub["Close"], window=60).rsi().to_numpy()
 
-        csum_close = np.cumsum(close)
+        # cumulative sums in float64
+        csum_close  = np.cumsum(close)
         csum_close2 = np.cumsum(close * close)
-        csum_vol = np.cumsum(vol)
-        csum_vol2 = np.cumsum(vol * vol)
-        csum_div = np.cumsum(div)
+        csum_vol    = np.cumsum(vol)
+        csum_vol2   = np.cumsum(vol * vol)
+        csum_div    = np.cumsum(div)
         csum_div_nz = np.cumsum((div != 0).astype(np.int64))
 
         s_dates = pd.Series(dates_arr)
         mask_targets = s_dates.dt.strftime("%m-%d").isin(dates)
         if not mask_targets.any():
             continue
+        target_end_pos = s_dates[mask_targets].groupby(s_dates[mask_targets]).tail(1).index.to_numpy()
 
-        target_end_pos = s_dates[mask_targets].groupby(
-            s_dates[mask_targets]).tail(1).index.to_numpy()
+        # small helper
+        def _range(csum, ei, si):
+            return csum[ei] - (csum[si-1] if si > 0 else 0.0)
 
         for ei in target_end_pos:
             end_date = dates_arr[ei]
             if pd.isna(end_date):
                 continue
 
-            start_date = pd.Timestamp(end_date).replace(
-                day=1) - relativedelta(months=2)
-            si = dates_arr.searchsorted(
-                np.datetime64(start_date, 'ns'), side='left')
+            start_date = pd.Timestamp(end_date).replace(day=1) - relativedelta(months=2)
+            si = dates_arr.searchsorted(np.datetime64(start_date, "ns"), side="left")
             if si > ei:
                 continue
 
-            cnt = (ei - si + 1)
+            cnt = ei - si + 1
+            if cnt <= 0:
+                continue
 
-            def _range(csum):
-                return csum[ei] - (csum[si-1] if si > 0 else 0)
-
-            sum_close = _range(csum_close)
-            sum_close2 = _range(csum_close2)
+            # price stats
+            sum_close  = _range(csum_close,  ei, si)
+            sum_close2 = _range(csum_close2, ei, si)
             mean_close = sum_close / cnt
-            var_close = (sum_close2 - (sum_close * sum_close) /
-                         cnt) / (cnt - 1) if cnt > 1 else np.nan
-            std_close = np.sqrt(var_close) if cnt > 1 else np.nan
 
-            sum_vol = _range(csum_vol)
-            sum_vol2 = _range(csum_vol2)
-            mean_vol = sum_vol / cnt
-            var_vol = (sum_vol2 - (sum_vol * sum_vol) / cnt) / \
-                (cnt - 1) if cnt > 1 else np.nan
-            std_vol = np.sqrt(var_vol) if cnt > 1 else np.nan
+            if cnt > 1:
+                # sample variance via cumsums
+                var_num   = sum_close2 - (sum_close * sum_close) / cnt
+                var_close = var_num / (cnt - 1)
+
+                # clamp tiny negatives caused by FP error
+                if var_close < 0:
+                    if var_close > -1e-12:
+                        var_close = 0.0
+                    else:
+                        var_close = np.nan
+                std_close = np.sqrt(var_close) if np.isfinite(var_close) else np.nan
+            else:
+                std_close = np.nan
 
             w_close = close[si:ei+1]
-            w_vol = vol[si:ei+1]
+            median_close = float(np.median(w_close))
+            min_close    = float(np.min(w_close))
+            max_close    = float(np.max(w_close))
 
-            sum_div = float(_range(csum_div))
-            cnt_div_nz = int(_range(csum_div_nz))
-            mean_div_ex_zero = (
-                sum_div / cnt_div_nz) if cnt_div_nz > 0 else 0.0
+            # volume stats
+            sum_vol  = _range(csum_vol,  ei, si)
+            sum_vol2 = _range(csum_vol2, ei, si)
+            mean_vol = sum_vol / cnt
+            if cnt > 1:
+                var_num_v = sum_vol2 - (sum_vol * sum_vol) / cnt
+                var_vol   = var_num_v / (cnt - 1)
+                if var_vol < 0:
+                    if var_vol > -1e-12:
+                        var_vol = 0.0
+                    else:
+                        var_vol = np.nan
+                std_vol = np.sqrt(var_vol) if np.isfinite(var_vol) else np.nan
+            else:
+                std_vol = np.nan
+
+            w_vol = vol[si:ei+1]
+            median_vol = float(np.median(w_vol))
+            min_vol    = int(np.min(w_vol))
+            max_vol    = int(np.max(w_vol))
+
+            # dividends
+            sum_div      = float(_range(csum_div, ei, si))
+            cnt_div_nz   = int(_range(csum_div_nz, ei, si))
+            mean_div_ex_zero = (sum_div / cnt_div_nz) if cnt_div_nz > 0 else 0.0
 
             results.append({
                 "Ticker": ticker,
                 "Date": pd.Timestamp(end_date),
                 "ClosePrice": float(close[ei]),
-                "MinPrice": float(np.min(w_close)),
-                "MaxPrice": float(np.max(w_close)),
+                "MinPrice": min_close,
+                "MaxPrice": max_close,
                 "StdPrice": float(std_close),
                 "MeanPrice": float(mean_close),
-                "MedianPrice": float(np.median(w_close)),
-                "MinVolume": int(np.min(w_vol)),
-                "MaxVolume": int(np.max(w_vol)),
+                "MedianPrice": median_close,
+                "MinVolume": min_vol,
+                "MaxVolume": max_vol,
                 "StdVolume": float(std_vol),
                 "MeanVolume": float(mean_vol),
-                "MedianVolume": float(np.median(w_vol)),
+                "MedianVolume": median_vol,
                 "SumDividends": sum_div,
                 "MeanDividends": float(mean_div_ex_zero),
                 "CountDividends": cnt_div_nz,
-                "RSI_14": float(rsi[ei]),
+                "RSI": float(rsi[ei]),
                 "MACD": float(macd_line[ei]),
                 "MACD_Signal": float(macd_signal[ei]),
                 "MACD_Hist": float(macd_hist[ei]),
@@ -158,17 +189,26 @@ def compute_quarter_metrics(df, dates):
 
     return pd.DataFrame(results)
 
-def clean_numeric_column(series):
-    # Convert all values to string and strip whitespace.
+def clean_numeric_column(series, percent_to_decimal=True):
+    """
+    Clean a Series of messy numeric strings and return numeric dtype.
+    If percent_to_decimal=True, values ending with '%' are converted to decimals (e.g. '12%' -> 0.12).
+    """
     s = series.astype(str).str.strip()
-    # Remove dollar sign (the regex ensures that only the $ symbol is removed).
-    s = s.str.replace(r'\$', '', regex=True)
-    # Remove commas.
-    s = s.str.replace(',', '', regex=True)
-    # Replace values that are exactly "-" or empty with "0"
-    s = s.replace({'-': '0', '': '0'})
-    # Convert to numeric (this will preserve negative numbers)
-    return pd.to_numeric(s, errors='coerce')
+
+    # remove $ and commas
+    s = s.str.replace(r'[\$,]', '', regex=True)
+
+    # convert parentheses to negative numbers: "(1,234)" -> "-1234"
+    s = s.str.replace(r'^\((.*)\)$', r'-\1', regex=True)
+
+    # Optionally convert percent strings to decimal
+    if percent_to_decimal:
+        pct_mask = s.str.endswith('%')
+        # strip '%' and convert the rest
+        numeric = pd.to_numeric(s.str.rstrip('%'), downcast='float', errors='coerce')
+        numeric.loc[pct_mask] = numeric.loc[pct_mask] / 100.0
+        return numeric
 
 def calc_quarterly_pct_diff(df, ticker_col='ticker', date_col='date', lags=[1, 4]):
     """
@@ -260,12 +300,15 @@ prices_agg_melt.columns = ['Ticker', 'Date', 'Variable', 'Value']
 
 # Concatenate financial nad proce data
 sp500_merged = pd.concat([financials_fiscal, prices_agg_melt], axis=0)
+sp500_merged = (sp500_merged
+                .sort_values(['Ticker','Date','Variable'])
+                .drop_duplicates(['Ticker','Date','Variable'], keep='last'))
 sp500_merged['Value'] = clean_numeric_column(sp500_merged['Value'])
 sp500_merged['Date'] = sp500_merged['Date'].astype('str').str[:10]
 
 # Reshaping merged df to wide format and drop duplicates
 sp500_wide = sp500_merged[['Ticker', 'Date', 'Variable', 'Value']].pivot_table(
-    index=["Ticker", "Date"], columns="Variable", values="Value")
+    index=["Ticker", "Date"], columns="Variable", values="Value", observed=True, aggfunc='first')
 sp500_wide.reset_index(inplace=True)
 
 sp500_wide_clean = sp500_wide.dropna(
@@ -285,8 +328,8 @@ sp500_diff.fillna(0, inplace=True)
 sp500_diff.drop(columns=['Symbol'], axis=1, inplace=True)
 sp500_diff['Founded'] = sp500_diff['Founded'].str[0:4].astype('int')
 
-# Sace result as CSV
-sp500_diff.to_csv('sp500_diff.csv')
+# Save result as CSV
+sp500_diff.to_csv(f'D:/GitHub/sp500/sp500_diff_{run_stamp}.csv')
 
 # restore normal sleep behavior
 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
