@@ -13,10 +13,10 @@ import ctypes
 from datetime import datetime
 
 run_stamp = datetime.now().strftime("%d%m%Y")  # {timestamp}
-prices_path = "sp500_prices_02092025.csv"
-financials_path = "sp500_financials_01092025.csv"
-financials_0_path = "sp500_financials_13082025.csv"
-names_path = "sp500_names.csv"
+prices_path = "sp500_prices_04012026.csv"
+financials_path = "sp500_financials_03012026.csv"
+financials_0_path = "sp500_financials_01092025.csv"
+names_path = "sp500_names_03012026.csv"
 
 # tell Windows to stay awake
 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)

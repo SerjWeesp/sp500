@@ -12,12 +12,13 @@ from datetime import datetime
 import yfinance as yf
 from bs4 import BeautifulSoup
 
+
 DATA_DIR = r"D:/GitHub/sp500"
 run_stamp = datetime.now().strftime("%d%m%Y")  # {timestamp}
 final_csv = os.path.join(DATA_DIR, f"sp500_prices_{run_stamp}.csv")
-names_csv = os.path.join(DATA_DIR, "sp500_names.csv")
+names_csv = os.path.join(DATA_DIR, "sp500_names_03012026.csv")
 sp500_names = pd.read_csv(names_csv)
-tickers = sp500_names["Symbol"].astype(str).tolist()
+tickers = [t.replace(".", "-").upper() for t in sp500_names["Symbol"].astype(str)]
 
 
 # Stock data
@@ -46,3 +47,4 @@ for ticker_sym in tickers:
     print(count, f"{ticker_sym} processed. Total records: {len(price_df)}")
 
 price_df.to_csv(final_csv)
+print("Not scrapped tickers:", set(tickers) - set(price_df['Company'].unique()))

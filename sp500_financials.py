@@ -35,13 +35,13 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # -------------------------------
 # Config & paths
 # -------------------------------
-DATA_DIR = r"D:/GitHub/sp500"
+DATA_DIR = r"D:\GitHub\sp500"
 os.makedirs(DATA_DIR, exist_ok=True)
 EMAIL = os.getenv("APP_EMAIL") or input("Email: ")
 PASSWORD = os.getenv("APP_PASSWORD") or getpass("Password: ")
 
 run_stamp = datetime.now().strftime("%d%m%Y")  # {timestamp}
-names_csv = os.path.join(DATA_DIR, "sp500_names.csv")
+names_csv = os.path.join(DATA_DIR, f"sp500_names_{run_stamp}.csv")
 state_pkl = os.path.join(DATA_DIR, f"sp500_financials_state_{run_stamp}.pkl")   # timestamped
 final_csv = os.path.join(DATA_DIR, f"sp500_financials_{run_stamp}.csv")
 
@@ -203,7 +203,7 @@ try:
                         )
                     )
                     quarters_btn.click()
-                    time.sleep(2)
+                    time.sleep(3)
 
                     # Read table
                     table_elem = driver.find_element(By.XPATH, '//*[@id="main-table"]')
