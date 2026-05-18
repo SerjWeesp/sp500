@@ -13,12 +13,15 @@ import yfinance as yf
 from bs4 import BeautifulSoup
 
 
-DATA_DIR = r"D:/GitHub/sp500"
+DATA_DIR = r"D:/GitHub/sp500/data"
 run_stamp = datetime.now().strftime("%d%m%Y")  # {timestamp}
 final_csv = os.path.join(DATA_DIR, f"sp500_prices_{run_stamp}.csv")
 names_csv = os.path.join(DATA_DIR, "sp500_names_03012026.csv")
 sp500_names = pd.read_csv(names_csv)
 tickers = [t.replace(".", "-").upper() for t in sp500_names["Symbol"].astype(str)]
+
+import yfinance as yf
+import pandas as pd
 
 
 # Stock data
@@ -27,10 +30,14 @@ count = 0
 
 for ticker_sym in tickers:
     ticker = yf.Ticker(ticker_sym)
-    ticker_df = ticker.history(
-        period='max', interval='1d', auto_adjust=True).sort_index()
-    if ticker_df.empty:
-        print(f"No data for ticker {ticker_sym}, skipping.")
+    try:
+        ticker_df = ticker.history(
+            period='max', interval='1d', auto_adjust=True).sort_index()
+        if ticker_df.empty:
+            print(f"No data for ticker {ticker_sym}, skipping.")
+            continue
+    except Exception as e:
+        print(f"Error fetching data for {ticker_sym}: {e}")
         continue
 
     # Create a full date range from the first to the last trading day.

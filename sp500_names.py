@@ -15,6 +15,10 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 RUN_STUMP = datetime.now().strftime("%d%m%Y")  # {timestamp}
+DATA_DIR = r"D:\GitHub\sp500\data"
+os.makedirs(DATA_DIR, exist_ok=True)
+names_csv = os.path.join(DATA_DIR, f"sp500_names_{RUN_STUMP}.csv")
+
 
 # -------------------------------
 # Get S&P 500 Tickers from Wikipedia
@@ -32,7 +36,6 @@ soup_wiki = BeautifulSoup(wiki_response.text, 'html.parser')
 table = soup_wiki.find('table', {'class': "wikitable"})
 sp500 = pd.read_html(str(table))[0]
 
-# tickers = sp500['Symbol'].str.replace('.', '-', regex=False)
-sp500.to_csv(f'sp500_names_{RUN_STUMP}.csv')
+sp500['Symbol'] = sp500['Symbol'].str.replace('.', '-', regex=False) # Sanitize the ticker format for Yahoo Finance#
+sp500.to_csv(names_csv)
 print("Total number of tickers: ", len(sp500))
-

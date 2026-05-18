@@ -12,11 +12,12 @@ import ta
 import ctypes
 from datetime import datetime
 
-run_stamp = datetime.now().strftime("%d%m%Y")  # {timestamp}
-prices_path = "sp500_prices_04012026.csv"
-financials_path = "sp500_financials_03012026.csv"
-financials_0_path = "sp500_financials_01092025.csv"
-names_path = "sp500_names_03012026.csv"
+
+run_stamp = '14052026' #datetime.now().strftime("%d%m%Y")  # {timestamp}
+prices_path = f"data/sp500_prices_{run_stamp}.csv"
+financials_path = f"data/sp500_financials_{run_stamp}.csv"
+financials_0_path = "data/sp500_financials_01092025.csv"
+names_path = f"data/sp500_names_{run_stamp}.csv"
 
 # tell Windows to stay awake
 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
@@ -259,6 +260,7 @@ names = pd.read_csv(names_path)
 
 # Merging old data with new and rremove duplicates
 financials = pd.read_csv(financials_path, low_memory=False)
+financials = financials[~financials['Fiscal Quarter'].astype(str).str.contains('undefined', case=False, na=False)] # Remove rows with 'undefined' in 'Fiscal Quarter'
 financials_0 = pd.read_csv(financials_0_path, low_memory=False)
 financials = pd.concat([financials, financials_0], axis=0,
                        ignore_index=True).drop_duplicates()
@@ -326,6 +328,7 @@ sp500_diff.dropna(subset=['ClosePrice_pct_diff_1',
                   'ClosePrice_pct_diff_4'], inplace=True)
 sp500_diff.fillna(0, inplace=True)
 sp500_diff.drop(columns=['Symbol'], axis=1, inplace=True)
+sp500_diff = sp500_diff[sp500_diff['Founded']!=0].dropna(subset=['Founded'])
 sp500_diff['Founded'] = sp500_diff['Founded'].str[0:4].astype('int')
 
 # Save result as CSV

@@ -35,7 +35,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # -------------------------------
 # Config & paths
 # -------------------------------
-DATA_DIR = r"D:\GitHub\sp500"
+DATA_DIR = r"D:\GitHub\sp500\data"
 os.makedirs(DATA_DIR, exist_ok=True)
 EMAIL = os.getenv("APP_EMAIL") or input("Email: ")
 PASSWORD = os.getenv("APP_PASSWORD") or getpass("Password: ")
@@ -60,7 +60,12 @@ reports = ["", "balance-sheet", "cash-flow-statement", "ratios"]
 def init_driver():
     opts = EdgeOptions()
     opts.page_load_strategy = "eager"
-    # opts.add_argument("--headless=new")  # enable if you want headless
+    #opts.add_argument("--headless=new") 
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    opts.add_argument("--log-level=3")  # Only log FATAL browser errors
+    opts.add_argument("--silent")
+    opts.add_experimental_option('excludeSwitches', ['enable-logging'])
     service = EdgeService(executable_path=edge_driver_path)
     drv = webdriver.Edge(service=service, options=opts)
     w = WebDriverWait(drv, page_wait_seconds)
@@ -126,34 +131,41 @@ driver, wait = init_driver()
 driver.get(url)
 driver.maximize_window()
 
-# Cookie banner 
-time.sleep(1)
+# 1. Cookie Banner
 try:
-    btn = driver.find_element(
-        By.XPATH,
-        "/html/body/div[2]/div[2]/div[2]/div[2]/div[2]/button[1]/p",
+    # Instead of an absolute path, search the entire DOM (//) for a button 
+    # that contains the word "Accept" or "Agree" (case-insensitive approach)
+    cookie_btn = WebDriverWait(driver, 5).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]"))
     )
-    btn.click()
-    
-except NoSuchElementException:
-    pass
-except Exception:
+    cookie_btn.click()
+except TimeoutException:
+    # If the banner doesn't appear within 5 seconds, just move on
     pass
 
-login = driver.find_element(
-    By.XPATH,
-    "/html/body/div/header/div/div[2]/a[1]",
+# 2. Login Navigation Button
+# Find any anchor tag (<a>) anywhere on the page where the URL link contains 'login'
+login_btn = wait.until(
+    EC.element_to_be_clickable((By.CSS_SELECTOR, "a[href*='login']"))
 )
-login.click()
+login_btn.click()
 time.sleep(1)
-email = driver.find_element(
-    By.XPATH,
-    "/html/body/div/div[1]/div[2]/main/div/form/input[1]",
+
+# 3. Email Input
+# Wait for an input field specifically designated for email addresses
+email_box = wait.until(
+    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], input[name='email']"))
 )
-email.send_keys(EMAIL)
-password_box = driver.find_element(By.XPATH, "/html/body/div/div[1]/div[2]/main/div/form/input[2]")
+email_box.send_keys(EMAIL)
+
+# 4. Password Input
+# Wait for the input field designated to hide characters (type='password')
+password_box = wait.until(
+    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password'], input[name='password']"))
+)
 password_box.send_keys(PASSWORD)
 password_box.send_keys(Keys.RETURN)
+time.sleep(1)
 
 # -------------------------------
 # Main scraping loop
