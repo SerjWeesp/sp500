@@ -11,6 +11,8 @@ from dateutil.relativedelta import relativedelta
 import ta
 import ctypes
 from datetime import datetime
+import locale
+locale.setlocale(locale.LC_TIME, 'en_US.UTF-8')
 
 
 run_stamp = '14052026' #datetime.now().strftime("%d%m%Y")  # {timestamp}
@@ -18,6 +20,7 @@ prices_path = f"data/sp500_prices_{run_stamp}.csv"
 financials_path = f"data/sp500_financials_{run_stamp}.csv"
 financials_0_path = "data/sp500_financials_01092025.csv"
 names_path = f"data/sp500_names_{run_stamp}.csv"
+dates_path = f"data/sp500_report_dates_{run_stamp}.csv"
 
 # tell Windows to stay awake
 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
@@ -91,7 +94,7 @@ def compute_quarter_metrics(df, dates):
         csum_div_nz = np.cumsum((div != 0).astype(np.int64))
 
         s_dates = pd.Series(dates_arr)
-        mask_targets = s_dates.dt.strftime("%m-%d").isin(dates)
+        mask_targets = s_dates.dt.strftime("%Y-%m-%d").isin(dates)
         if not mask_targets.any():
             continue
         target_end_pos = s_dates[mask_targets].groupby(s_dates[mask_targets]).tail(1).index.to_numpy()
@@ -255,7 +258,7 @@ def calc_quarterly_pct_diff(df, ticker_col='ticker', date_col='date', lags=[1, 4
 
 prices = pd.read_csv(prices_path, index_col=0, parse_dates=True, low_memory=False)
 prices.rename(columns={"index": "Date"}, inplace=True)
-
+report_dates = pd.read_csv(dates_path)
 names = pd.read_csv(names_path)
 
 # Merging old data with new and rremove duplicates
@@ -279,6 +282,8 @@ financials_clean['Date'] = pd.to_datetime(
     financials_clean['Period Ending'].str[8:], format='%b %d, %Y', errors='coerce')
 financials_clean.drop(columns=['Period Ending'], inplace=True)
 # financials_clean.drop(columns=['Unnamed: 0'], inplace=True)
+
+
 financials_clean[['Quarter', 'Fiscal year']
                  ] = financials_clean['Fiscal Quarter'].str.split(' ', expand=True)
 financials_clean['Quarter'] = financials_clean['Quarter'].str[1:].astype(
@@ -287,20 +292,44 @@ financials_clean['Fiscal year'] = financials_clean['Fiscal year'].astype(
     int)        # Convert year to int
 financials_clean.drop(columns=['Fiscal Quarter'], inplace=True)
 
+
+
+# Load the SEC dates you scraped (adjust filename/path as necessary)
+report_dates = pd.read_csv(dates_path)
+report_dates['Period Ending'] = pd.to_datetime(report_dates['Period Ending']).dt.strftime('%Y-%m-%d')
+
+# financials_clean['Date'] currently holds the StockAnalysis 'Period Ending' date. Format it for joining.
+financials_clean['Period Ending Formatted'] = financials_clean['Date'].dt.strftime('%Y-%m-%d')
+
+# Merge to attach the actual SEC publication date
+financials_with_filing = financials_clean.merge(
+    report_dates[['Ticker', 'Period Ending', 'Filing Date']],
+    left_on=['Ticker', 'Period Ending Formatted'],
+    right_on=['Ticker', 'Period Ending'],
+    how='inner'
+)
+
+# Set the operational 'Date' to the Filing Date, not the Period Ending
+financials_with_filing['Date'] = pd.to_datetime(financials_with_filing['Filing Date'])
+
+# Drop the temporary merge columns so restructure_df receives exactly the columns it expects
+financials_with_filing.drop(columns=['Period Ending', 'Period Ending Formatted', 'Filing Date'], inplace=True)
+# ----------------------------------------
+
 # Move Quarter/Fiscal year into Metric/Value rows so financials are long-form.
-financials_fiscal = restructure_df(financials_clean)
+financials_fiscal = restructure_df(financials_with_filing)
 financials_fiscal.columns = ['Ticker', 'Date', 'Variable', 'Value']
 financials_fiscal.reset_index(drop=True, inplace=True)
 
 # Derive the list of dates
-dates = financials_fiscal['Date'].astype('str').str[5:].unique()
+dates = financials_fiscal['Date'].astype('str').str[:10].unique()
 
 # Aggregate price values and reshaping into long format
 prices_agg = compute_quarter_metrics(prices, dates)
 prices_agg_melt = prices_agg.melt(id_vars=['Ticker', 'Date'])
 prices_agg_melt.columns = ['Ticker', 'Date', 'Variable', 'Value']
 
-# Concatenate financial nad proce data
+# Concatenate financial and proce data
 sp500_merged = pd.concat([financials_fiscal, prices_agg_melt], axis=0)
 sp500_merged = (sp500_merged
                 .sort_values(['Ticker','Date','Variable'])
@@ -332,7 +361,7 @@ sp500_diff = sp500_diff[sp500_diff['Founded']!=0].dropna(subset=['Founded'])
 sp500_diff['Founded'] = sp500_diff['Founded'].str[0:4].astype('int')
 
 # Save result as CSV
-sp500_diff.to_csv(f'D:/GitHub/sp500/sp500_diff_{run_stamp}.csv')
+sp500_diff.to_csv(f'D:/GitHub/sp500/data/sp500_diff_{run_stamp}.csv')
 
 # restore normal sleep behavior
 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
